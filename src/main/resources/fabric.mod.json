@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "zulip-bridge",
+  "version": "${version}",
+  "name": "Zulip Bridge",
+  "description": "Two-way chat bridge between Minecraft and Zulip.",
+  "authors": ["remgr"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "dev.remgr.zulipbridge.ZulipBridgeClient"
+    ]
+  },
+  "mixins": [
+    "zulip-bridge.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.1",
+    "java": ">=21",
+    "fabric-api": "*",
+    "owo": ">=0.12.15"
+  },
+  "suggests": {
+    "modmenu": "*"
+  }
+}

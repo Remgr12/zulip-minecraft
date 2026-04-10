@@ -1,0 +1,32 @@
+{
+  "text.config.zulip-bridge.option.zulipBaseUrl":           "Zulip Base URL",
+  "text.config.zulip-bridge.option.zulipBaseUrl.tooltip":   "Full URL of your Zulip organisation.\nExample: https://myorg.zulipchat.com",
+
+  "text.config.zulip-bridge.option.botEmail":               "Bot Email",
+  "text.config.zulip-bridge.option.botEmail.tooltip":       "Email address of the Zulip bot account used for the bridge.",
+
+  "text.config.zulip-bridge.option.botApiKey":              "Bot API Key",
+  "text.config.zulip-bridge.option.botApiKey.tooltip":      "API key for the bot account.\nGenerate one at Settings → Your account → API key.",
+
+  "text.config.zulip-bridge.section.stream":                "Stream / Topic",
+
+  "text.config.zulip-bridge.option.streamName":             "Stream Name",
+  "text.config.zulip-bridge.option.streamName.tooltip":     "Name of the Zulip stream (channel) to bridge.",
+
+  "text.config.zulip-bridge.option.topicName":              "Topic Name",
+  "text.config.zulip-bridge.option.topicName.tooltip":      "Topic within the stream to bridge.",
+
+  "text.config.zulip-bridge.section.behaviour":             "Behaviour",
+
+  "text.config.zulip-bridge.option.pollIntervalSeconds":    "Poll Interval (seconds)",
+  "text.config.zulip-bridge.option.pollIntervalSeconds.tooltip": "How often to check Zulip for new messages.\nLower values are more responsive but use more API calls.",
+
+  "text.config.zulip-bridge.option.enabled":                "Enabled",
+  "text.config.zulip-bridge.option.enabled.tooltip":        "Enable or disable the bridge. Changes take effect on next world join.",
+
+  "text.config.zulip-bridge.option.playerDisplayName":      "Player Display Name",
+  "text.config.zulip-bridge.option.playerDisplayName.tooltip": "Name shown in Zulip when you chat. Leave blank to use your in-game name.",
+
+  "text.config.zulip-bridge.option.incomingPrefix":         "Incoming Message Prefix",
+  "text.config.zulip-bridge.option.incomingPrefix.tooltip": "Text prepended to Zulip messages shown in Minecraft chat."
+}
