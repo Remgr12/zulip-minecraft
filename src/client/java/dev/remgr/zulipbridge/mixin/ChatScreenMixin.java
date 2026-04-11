@@ -1,7 +1,8 @@
 package dev.remgr.zulipbridge.mixin;
 
 import dev.remgr.zulipbridge.ZulipBridgeClient;
-import dev.remgr.zulipbridge.ZulipPollingThread;
+import dev.remgr.zulipbridge.ZulipBridgeCommandHandler;
+import net.minecraft.client.gui.hud.ChatHud;
 import net.minecraft.client.gui.screen.ChatScreen;
 import net.minecraft.client.MinecraftClient;
 import org.spongepowered.asm.mixin.Mixin;
@@ -13,30 +14,36 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * Intercepts outgoing chat messages so we can relay them to Zulip.
  *
  * <p>The injection target is {@link ChatScreen#sendMessage(String, boolean)},
- * which is called right before the message is sent to the server. We hook
- * into its entry point so the message is always forwarded, even if the user
- * presses Enter on a command (commands are filtered out in
- * {@link ZulipPollingThread#sendToZulip}).
+ * which is called right before the message is sent to the server. Messages are
+ * only bridged through the local command syntax {@code /zulip send <message>}
+ * using the configured command name.
  */
 @Mixin(ChatScreen.class)
 public class ChatScreenMixin {
 
-    @Inject(method = "sendMessage", at = @At("HEAD"))
+    @Inject(method = "sendMessage(Ljava/lang/String;Z)V", at = @At("HEAD"), cancellable = true)
     private void onSendMessage(String chatText, boolean addToHistory, CallbackInfo ci) {
-        // Only relay if the bridge is active and the text is not a command.
-        if (!ZulipBridgeClient.isRunning()) return;
         if (chatText == null || chatText.isBlank()) return;
-        if (chatText.startsWith("/")) return;
 
         var cfg = ZulipBridgeClient.CONFIG;
+        String commandName = cfg.commandName();
+        if (commandName == null || commandName.isBlank()) return;
 
-        // Determine the player display name.
-        String name = cfg.playerDisplayName();
-        if (name == null || name.isBlank()) {
-            var player = MinecraftClient.getInstance().player;
-            name = player != null ? player.getName().getString() : "Minecraft";
+        String trimmedCommandName = commandName.trim();
+        if (trimmedCommandName.equals("zulip")) return;
+
+        String commandPrefix = "/" + trimmedCommandName;
+        if (!chatText.startsWith(commandPrefix)) return;
+
+        MinecraftClient client = MinecraftClient.getInstance();
+        String remainder = chatText.substring(commandPrefix.length()).trim();
+
+        if (addToHistory && client.inGameHud != null) {
+            ChatHud chatHud = client.inGameHud.getChatHud();
+            chatHud.addToMessageHistory(chatText);
         }
-
-        ZulipPollingThread.sendToZulip(cfg, "**" + name + "**: " + chatText);
+        client.setScreen(null);
+        ci.cancel();
+        ZulipBridgeCommandHandler.execute(client, remainder);
     }
 }

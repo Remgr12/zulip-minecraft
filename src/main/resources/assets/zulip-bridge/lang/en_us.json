@@ -2,11 +2,11 @@
   "text.config.zulip-bridge.option.zulipBaseUrl":           "Zulip Base URL",
   "text.config.zulip-bridge.option.zulipBaseUrl.tooltip":   "Full URL of your Zulip organisation.\nExample: https://myorg.zulipchat.com",
 
-  "text.config.zulip-bridge.option.botEmail":               "Bot Email",
-  "text.config.zulip-bridge.option.botEmail.tooltip":       "Email address of the Zulip bot account used for the bridge.",
+  "text.config.zulip-bridge.option.botEmail":               "Account Email",
+  "text.config.zulip-bridge.option.botEmail.tooltip":       "Email address of the Zulip account used by this Minecraft client.\nEach player can use their own account locally.",
 
-  "text.config.zulip-bridge.option.botApiKey":              "Bot API Key",
-  "text.config.zulip-bridge.option.botApiKey.tooltip":      "API key for the bot account.\nGenerate one at Settings → Your account → API key.",
+  "text.config.zulip-bridge.option.botApiKey":              "Account API Key",
+  "text.config.zulip-bridge.option.botApiKey.tooltip":      "API key for the Zulip account used by this Minecraft client.\nGenerate one at Settings → Personal settings → Account & privacy.",
 
   "text.config.zulip-bridge.section.stream":                "Stream / Topic",
 
@@ -16,17 +16,60 @@
   "text.config.zulip-bridge.option.topicName":              "Topic Name",
   "text.config.zulip-bridge.option.topicName.tooltip":      "Topic within the stream to bridge.",
 
+  "text.config.zulip-bridge.option.messageTarget":          "Message Target",
+  "text.config.zulip-bridge.option.messageTarget.tooltip":  "Choose whether the bridge uses a stream/topic or a direct-message conversation.",
+  "text.config.zulip-bridge.option.messageTarget.value.stream": "Stream",
+  "text.config.zulip-bridge.option.messageTarget.value.direct_message": "Direct Message",
+
+  "text.config.zulip-bridge.option.directMessageRecipients": "DM Recipients",
+  "text.config.zulip-bridge.option.directMessageRecipients.tooltip": "Comma-separated Zulip API email addresses for the DM conversation.\nDo not include your own email.",
+
   "text.config.zulip-bridge.section.behaviour":             "Behaviour",
+
+  "text.config.zulip-bridge.option.commandName":            "Command Name",
+  "text.config.zulip-bridge.option.commandName.tooltip":    "Local Minecraft command used to send to Zulip.\nExample: 'zulip' means /zulip send hello.",
 
   "text.config.zulip-bridge.option.pollIntervalSeconds":    "Poll Interval (seconds)",
   "text.config.zulip-bridge.option.pollIntervalSeconds.tooltip": "How often to check Zulip for new messages.\nLower values are more responsive but use more API calls.",
 
   "text.config.zulip-bridge.option.enabled":                "Enabled",
-  "text.config.zulip-bridge.option.enabled.tooltip":        "Enable or disable the bridge. Changes take effect on next world join.",
+  "text.config.zulip-bridge.option.enabled.tooltip":        "Enable or disable the bridge. Changes apply immediately while in-game.",
+
+  "text.config.zulip-bridge.option.suppressSelfEcho":       "Suppress Self-Echo",
+  "text.config.zulip-bridge.option.suppressSelfEcho.tooltip": "Hide incoming Zulip messages authored by the configured account to avoid duplicates.",
 
   "text.config.zulip-bridge.option.playerDisplayName":      "Player Display Name",
   "text.config.zulip-bridge.option.playerDisplayName.tooltip": "Name shown in Zulip when you chat. Leave blank to use your in-game name.",
 
+  "text.config.zulip-bridge.option.prependPlayerDisplayNameToOutgoing": "Include Minecraft Name In Outgoing",
+  "text.config.zulip-bridge.option.prependPlayerDisplayNameToOutgoing.tooltip": "If enabled, outgoing Zulip messages are prefixed with your Minecraft player name.\nIf disabled, Zulip only shows your Zulip account name as the sender.",
+
   "text.config.zulip-bridge.option.incomingPrefix":         "Incoming Message Prefix",
-  "text.config.zulip-bridge.option.incomingPrefix.tooltip": "Text prepended to Zulip messages shown in Minecraft chat."
+  "text.config.zulip-bridge.option.incomingPrefix.tooltip": "Text prepended to Zulip messages shown in Minecraft chat.",
+
+  "text.config.zulip-bridge.option.showIncomingPrefix":     "Show Incoming Prefix",
+  "text.config.zulip-bridge.option.showIncomingPrefix.tooltip": "Show or hide the Zulip prefix/badge on incoming messages.\nOnly the sender color will be shown when disabled.",
+
+  "text.config.zulip-bridge.option.senderColor":            "Sender Color",
+  "text.config.zulip-bridge.option.senderColor.tooltip":    "Hex color for incoming sender names.\nUse #RRGGBB, for example #3A9E5C.",
+
+  "text.config.zulip-bridge.option.messageColor":           "Message Color",
+  "text.config.zulip-bridge.option.messageColor.tooltip":   "Hex color for incoming message text.\nUse #RRGGBB, for example #50C878.",
+
+  "text.config.zulip-bridge.option.incomingMessageFormat":  "Incoming Message Format",
+  "text.config.zulip-bridge.option.incomingMessageFormat.tooltip": "Choose whether incoming Zulip messages are stripped to plain text or shown as raw Markdown.",
+  "text.config.zulip-bridge.option.incomingMessageFormat.value.plain_text": "Plain Text",
+  "text.config.zulip-bridge.option.incomingMessageFormat.value.raw_markdown": "Raw Markdown",
+
+  "text.config.zulip-bridge.option.playIncomingSound":      "Play Incoming Sound",
+  "text.config.zulip-bridge.option.playIncomingSound.tooltip": "Play a local Minecraft UI sound when a Zulip message arrives.",
+
+  "text.config.zulip-bridge.option.showIncomingToast":      "Show Incoming Toast",
+  "text.config.zulip-bridge.option.showIncomingToast.tooltip": "Show a client-side toast notification when a Zulip message arrives.",
+
+  "text.config.zulip-bridge.option.showSuccessfulSendMessages": "Show Successful Send Messages",
+  "text.config.zulip-bridge.option.showSuccessfulSendMessages.tooltip": "Print a local chat line when a Zulip message is sent successfully. Failed sends are always shown.",
+
+  "key.zulip-bridge.open_gui": "Open Zulip Bridge UI",
+  "key.category.zulip-bridge.main": "Zulip Bridge"
 }

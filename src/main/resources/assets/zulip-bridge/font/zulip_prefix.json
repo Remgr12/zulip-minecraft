@@ -1,0 +1,13 @@
+{
+  "providers": [
+    {
+      "type": "bitmap",
+      "file": "zulip-bridge:font/pixil-frame-03.png",
+      "ascent": 7,
+      "height": 8,
+      "chars": [
+        "\ue000"
+      ]
+    }
+  ]
+}
