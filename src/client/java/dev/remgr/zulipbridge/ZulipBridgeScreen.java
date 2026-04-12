@@ -52,6 +52,10 @@ public class ZulipBridgeScreen extends Screen {
     private static final int CHANNEL_ROW_HEIGHT = 12;
     private static final int MESSAGE_LINE_HEIGHT = 10;
     private static final int MAX_HISTORY_MESSAGES = 100;
+    private static final int MAX_MENTION_SUGGESTIONS = 6;
+    private static final int MENTION_SUGGESTION_ROW_HEIGHT = 14;
+    private static final Set<String> PERSISTED_POLLED_CHANNELS = new HashSet<>();
+    private static boolean PERSISTED_POLL_ALL_CONVERSATIONS = false;
 
     private final ZulipBridgeConfig config;
     private final HttpClient httpClient;
@@ -92,8 +96,15 @@ public class ZulipBridgeScreen extends Screen {
     private boolean loadingChannels = false;
     private boolean loadingMessages = false;
     private boolean sendingMessage = false;
+    private boolean mentionUserLoadRequested = false;
     private int channelScroll = 0;
     private int messageScroll = 0;
+    private final List<UserEntry> mentionSuggestions = new ArrayList<>();
+    private int mentionTokenStart = -1;
+    private int mentionTokenEnd = -1;
+    private int mentionSuggestionsX = 0;
+    private int mentionSuggestionsY = 0;
+    private int mentionSuggestionsWidth = 0;
 
     private int channelsX;
     private int channelsY;
@@ -110,6 +121,12 @@ public class ZulipBridgeScreen extends Screen {
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(10))
                 .build();
+
+        synchronized (ZulipBridgeScreen.class) {
+            PERSISTED_POLL_ALL_CONVERSATIONS = false;
+            this.pollAllConversations = false;
+            this.polledChannels.addAll(PERSISTED_POLLED_CHANNELS);
+        }
     }
 
     @Override
@@ -117,6 +134,7 @@ public class ZulipBridgeScreen extends Screen {
         String previousTopic = this.topicField != null ? this.topicField.getText() : "";
         String previousMessage = this.messageField != null ? this.messageField.getText() : "";
 
+        this.clearChildren();
         this.recalculateLayout();
 
         int composeY = this.height - BOTTOM_MARGIN - INPUT_HEIGHT;
@@ -125,17 +143,12 @@ public class ZulipBridgeScreen extends Screen {
         
         int topicWidth;
         int messageWidth;
-        
-        if (this.showingDirectMessages) {
-            topicWidth = 0;
-            messageWidth = this.messagesWidth - sendWidth - spacing;
-        } else {
-            topicWidth = Math.min(220, Math.max(90, this.messagesWidth / 3));
-            messageWidth = this.messagesWidth - topicWidth - sendWidth - (spacing * 2);
-            if (messageWidth < 80) {
-                messageWidth = 80;
-                topicWidth = Math.max(80, this.messagesWidth - messageWidth - sendWidth - (spacing * 2));
-            }
+
+        topicWidth = Math.min(220, Math.max(90, this.messagesWidth / 3));
+        messageWidth = this.messagesWidth - topicWidth - sendWidth - (spacing * 2);
+        if (messageWidth < 80) {
+            messageWidth = 80;
+            topicWidth = Math.max(80, this.messagesWidth - messageWidth - sendWidth - (spacing * 2));
         }
 
         this.topicField = new TextFieldWidget(
@@ -173,29 +186,28 @@ public class ZulipBridgeScreen extends Screen {
         );
 
         if (this.showingDirectMessages) {
-            int newDmButtonWidth = 70;
+            int recipientY = composeY;
+            int newDmButtonWidth = Math.min(106, Math.max(84, this.channelsWidth / 2));
             this.composeNewDmButton = this.addDrawableChild(
-                    ButtonWidget.builder(Text.literal("New DM"), button -> this.toggleNewDmMode())
-                            .dimensions(this.messagesX, composeY - INPUT_HEIGHT - spacing, newDmButtonWidth, INPUT_HEIGHT)
+                    ButtonWidget.builder(Text.literal("Add Recipient"), button -> this.toggleNewDmMode())
+                            .dimensions(this.channelsX, recipientY, newDmButtonWidth, INPUT_HEIGHT)
                             .build()
             );
 
-            if (this.composingNewDm || this.selectedUserId == null) {
-                String previousRecipient = this.newRecipientField != null ? this.newRecipientField.getText() : "";
-                int recipientWidth = Math.min(180, this.messagesWidth - newDmButtonWidth - spacing * 2);
-                this.newRecipientField = new TextFieldWidget(
-                        this.textRenderer,
-                        this.messagesX + newDmButtonWidth + spacing,
-                        composeY - INPUT_HEIGHT - spacing,
-                        recipientWidth,
-                        INPUT_HEIGHT,
-                        Text.literal("Recipient")
-                );
-                this.newRecipientField.setMaxLength(200);
-                this.newRecipientField.setText(previousRecipient);
-                this.newRecipientField.setPlaceholder(Text.literal("Email or name..."));
-                this.addDrawableChild(this.newRecipientField);
-            }
+            String previousRecipient = this.newRecipientField != null ? this.newRecipientField.getText() : "";
+            int recipientWidth = Math.max(64, this.channelsWidth - newDmButtonWidth - spacing);
+            this.newRecipientField = new TextFieldWidget(
+                    this.textRenderer,
+                    this.channelsX + newDmButtonWidth + spacing,
+                    recipientY,
+                    recipientWidth,
+                    INPUT_HEIGHT,
+                    Text.literal("Recipient")
+            );
+            this.newRecipientField.setMaxLength(200);
+            this.newRecipientField.setText(previousRecipient);
+            this.newRecipientField.setPlaceholder(Text.literal("Email or name..."));
+            this.addDrawableChild(this.newRecipientField);
         }
 
         this.refreshButton = this.addDrawableChild(
@@ -218,15 +230,20 @@ public class ZulipBridgeScreen extends Screen {
         );
 
         this.addDrawableChild(
-                ButtonWidget.builder(Text.literal("Poll Settings"), button -> this.showPollSettings())
-                        .dimensions(this.width - RIGHT_MARGIN - 90, tabY, 90, INPUT_HEIGHT)
+                ButtonWidget.builder(Text.literal("Channel Filter"), button -> this.showPollSettings())
+                        .dimensions(this.width - RIGHT_MARGIN - 104, tabY, 104, INPUT_HEIGHT)
                         .build()
         );
 
         this.setInitialFocus(this.messageField);
+        this.setFocused(this.messageField);
         this.updateButtons();
 
-        if (this.channels.isEmpty() && !this.loadingChannels) {
+        if (this.showingDirectMessages) {
+            if (this.users.isEmpty() && !this.loadingChannels) {
+                this.loadUsers();
+            }
+        } else if (this.channels.isEmpty() && !this.loadingChannels) {
             this.loadChannels();
         } else if (this.selectedChannel != null && this.messages.isEmpty() && !this.loadingMessages) {
             this.loadMessages(this.selectedChannel);
@@ -236,6 +253,7 @@ public class ZulipBridgeScreen extends Screen {
     @Override
     public void tick() {
         this.updateButtons();
+        this.updateMentionSuggestions();
         
         long now = System.currentTimeMillis();
         if (now - this.lastPollTime >= POLL_INTERVAL_MS && !this.loadingMessages && !this.sendingMessage) {
@@ -463,6 +481,8 @@ public class ZulipBridgeScreen extends Screen {
             this.drawPollSettingsPanel(context, mouseX, mouseY);
         }
 
+        this.drawMentionSuggestions(context, mouseX, mouseY);
+
         super.render(context, mouseX, mouseY, delta);
     }
     
@@ -475,9 +495,9 @@ public class ZulipBridgeScreen extends Screen {
         context.fill(panelX, panelY, panelX + panelWidth, panelY + panelHeight, 0xEE1C1C1C);
         drawBorder(context, panelX, panelY, panelWidth, panelHeight, 0xFF4F4F4F);
         
-        context.drawTextWithShadow(this.textRenderer, "Poll Settings", panelX + 10, panelY + 10, 0xFFFFFFFF);
+        context.drawTextWithShadow(this.textRenderer, "Channel Filter", panelX + 10, panelY + 10, 0xFFFFFFFF);
         
-        context.drawTextWithShadow(this.textRenderer, "Select channels to poll:", panelX + 10, panelY + 30, 0xFFAAAAAA);
+        context.drawTextWithShadow(this.textRenderer, "Select channels for incoming chat:", panelX + 10, panelY + 30, 0xFFAAAAAA);
         
         int listTop = panelY + 50;
         int rowHeight = 20;
@@ -505,6 +525,145 @@ public class ZulipBridgeScreen extends Screen {
         context.drawTextWithShadow(this.textRenderer, "Click on channels to toggle", panelX + 10, buttonY, 0xFF888888);
     }
 
+    private void updateMentionSuggestions() {
+        this.mentionSuggestions.clear();
+        this.mentionTokenStart = -1;
+        this.mentionTokenEnd = -1;
+
+        if (this.messageField == null || !this.messageField.isFocused()) return;
+
+        String text = this.messageField.getText();
+        if (text == null || text.isBlank()) return;
+
+        int atIndex = text.lastIndexOf('@');
+        if (atIndex < 0) return;
+
+        int tokenEnd = atIndex + 1;
+        while (tokenEnd < text.length() && isMentionTokenChar(text.charAt(tokenEnd))) {
+            tokenEnd++;
+        }
+
+        if (tokenEnd != text.length()) return;
+
+        String query = text.substring(atIndex + 1, tokenEnd).trim();
+        if (query.startsWith("**")) return;
+
+        if (this.users.isEmpty()) {
+            if (!this.loadingChannels && !this.mentionUserLoadRequested) {
+                this.mentionUserLoadRequested = true;
+                this.loadUsers();
+            }
+            return;
+        }
+
+        this.mentionTokenStart = atIndex;
+        this.mentionTokenEnd = tokenEnd;
+        String normalizedQuery = query.toLowerCase(Locale.ROOT);
+
+        for (UserEntry user : this.users) {
+            String userName = user.name() == null ? "" : user.name();
+            String userEmail = user.email() == null ? "" : user.email();
+            String lowerName = userName.toLowerCase(Locale.ROOT);
+            String lowerEmail = userEmail.toLowerCase(Locale.ROOT);
+
+            if (normalizedQuery.isEmpty()
+                    || lowerName.startsWith(normalizedQuery)
+                    || lowerName.contains(normalizedQuery)
+                    || (!userEmail.isBlank() && lowerEmail.startsWith(normalizedQuery))
+                    || (!userEmail.isBlank() && lowerEmail.contains(normalizedQuery))) {
+                this.mentionSuggestions.add(user);
+                if (this.mentionSuggestions.size() >= MAX_MENTION_SUGGESTIONS) {
+                    break;
+                }
+            }
+        }
+    }
+
+    private void drawMentionSuggestions(DrawContext context, int mouseX, int mouseY) {
+        if (this.mentionSuggestions.isEmpty() || this.messageField == null || !this.messageField.isFocused()) return;
+
+        int panelWidth = Math.min(280, Math.max(170, this.messageField.getWidth()));
+        int panelHeight = this.mentionSuggestions.size() * MENTION_SUGGESTION_ROW_HEIGHT + 8;
+        int panelX = this.messageField.getX();
+        int panelY = this.messageField.getY() - panelHeight - 4;
+        if (panelY < TOP_MARGIN + HEADER_HEIGHT + STATUS_HEIGHT) {
+            panelY = this.messageField.getY() + this.messageField.getHeight() + 4;
+        }
+
+        this.mentionSuggestionsX = panelX;
+        this.mentionSuggestionsY = panelY;
+        this.mentionSuggestionsWidth = panelWidth;
+
+        context.fill(panelX, panelY, panelX + panelWidth, panelY + panelHeight, 0xEE1A1A22);
+        drawBorder(context, panelX, panelY, panelWidth, panelHeight, 0xFF4F4F62);
+
+        int rowY = panelY + 4;
+        for (int i = 0; i < this.mentionSuggestions.size(); i++) {
+            UserEntry user = this.mentionSuggestions.get(i);
+            boolean hovered = mouseX >= panelX + 1 && mouseX < panelX + panelWidth - 1
+                    && mouseY >= rowY && mouseY < rowY + MENTION_SUGGESTION_ROW_HEIGHT;
+            if (hovered) {
+                context.fill(panelX + 1, rowY, panelX + panelWidth - 1, rowY + MENTION_SUGGESTION_ROW_HEIGHT, 0x553A3A49);
+            }
+
+            String label = "@" + user.name();
+            if (user.email() != null && !user.email().isBlank()) {
+                label += " <" + user.email() + ">";
+            }
+            String trimmedLabel = this.textRenderer.trimToWidth(label, panelWidth - 8);
+            context.drawTextWithShadow(this.textRenderer, trimmedLabel, panelX + 4, rowY + 2, 0xFFE8E8E8);
+            rowY += MENTION_SUGGESTION_ROW_HEIGHT;
+        }
+    }
+
+    private boolean handleMentionSuggestionClick(int mouseX, int mouseY) {
+        if (this.mentionSuggestions.isEmpty()) return false;
+
+        int panelHeight = this.mentionSuggestions.size() * MENTION_SUGGESTION_ROW_HEIGHT + 8;
+        if (mouseX < this.mentionSuggestionsX
+                || mouseX >= this.mentionSuggestionsX + this.mentionSuggestionsWidth
+                || mouseY < this.mentionSuggestionsY
+                || mouseY >= this.mentionSuggestionsY + panelHeight) {
+            return false;
+        }
+
+        int rowIndex = (mouseY - this.mentionSuggestionsY - 4) / MENTION_SUGGESTION_ROW_HEIGHT;
+        if (rowIndex < 0 || rowIndex >= this.mentionSuggestions.size()) return false;
+
+        this.applyMentionSuggestion(this.mentionSuggestions.get(rowIndex));
+        return true;
+    }
+
+    private void applyMentionSuggestion(UserEntry user) {
+        if (this.messageField == null || this.mentionTokenStart < 0 || this.mentionTokenEnd < this.mentionTokenStart) return;
+
+        String text = this.messageField.getText();
+        if (text == null) return;
+
+        int safeEnd = Math.min(this.mentionTokenEnd, text.length());
+        String prefix = text.substring(0, this.mentionTokenStart);
+        String suffix = text.substring(safeEnd);
+        String mention = "@**" + user.name() + "**";
+
+        if (suffix.isEmpty()) {
+            suffix = " ";
+        } else if (!Character.isWhitespace(suffix.charAt(0))) {
+            suffix = " " + suffix;
+        }
+
+        this.messageField.setText(prefix + mention + suffix);
+        this.mentionSuggestions.clear();
+        this.mentionTokenStart = -1;
+        this.mentionTokenEnd = -1;
+    }
+
+    private static boolean isMentionTokenChar(char character) {
+        return Character.isLetterOrDigit(character)
+                || character == '_'
+                || character == '-'
+                || character == '.';
+    }
+
     @Override
     public boolean mouseClicked(Click click, boolean doubleClick) {
         if (super.mouseClicked(click, doubleClick)) return true;
@@ -512,6 +671,10 @@ public class ZulipBridgeScreen extends Screen {
         double mouseX = click.x();
         double mouseY = click.y();
         int button = click.button();
+
+        if (button == 0 && this.handleMentionSuggestionClick((int) mouseX, (int) mouseY)) {
+            return true;
+        }
 
         if (button == 0 && isInsideChannels(mouseX, mouseY)) {
             int rowTop = this.channelsY + PANEL_HEADER_HEIGHT + 2;
@@ -527,7 +690,11 @@ public class ZulipBridgeScreen extends Screen {
                     if (this.showingDirectMessages) {
                         String userId = clickedRow.channelName();
                         String userName = clickedRow.label().replaceFirst("^@", "");
-                        this.selectUser(userId, userName);
+                        if (this.composingNewDm) {
+                            this.selectRecipientForNewDm(userId, userName);
+                        } else {
+                            this.selectUser(userId, userName);
+                        }
                     } else {
                         this.selectChannel(clickedRow.channelName());
                     }
@@ -581,7 +748,17 @@ public class ZulipBridgeScreen extends Screen {
         return super.mouseScrolled(mouseX, mouseY, horizontalAmount, verticalAmount);
     }
 
-    private boolean handleKeyPressed(int keyCode, int scanCode, int modifiers) {
+    @Override
+    public boolean keyPressed(KeyInput keyInput) {
+        int keyCode = keyInput.key();
+        if (keyCode == GLFW.GLFW_KEY_TAB
+                && this.messageField != null
+                && this.messageField.isFocused()
+                && !this.mentionSuggestions.isEmpty()) {
+            this.applyMentionSuggestion(this.mentionSuggestions.getFirst());
+            return true;
+        }
+
         if ((keyCode == GLFW.GLFW_KEY_ENTER || keyCode == GLFW.GLFW_KEY_KP_ENTER)
                 && (this.messageField != null && this.messageField.isFocused()
                 || this.topicField != null && this.topicField.isFocused())) {
@@ -589,12 +766,7 @@ public class ZulipBridgeScreen extends Screen {
             return true;
         }
 
-        return super.keyPressed(new KeyInput(keyCode, scanCode, modifiers));
-    }
-
-    @Override
-    public boolean keyPressed(KeyInput keyInput) {
-        return this.handleKeyPressed(keyInput.key(), keyInput.scancode(), keyInput.modifiers());
+        return super.keyPressed(keyInput);
     }
 
     private void recalculateLayout() {
@@ -727,20 +899,28 @@ public class ZulipBridgeScreen extends Screen {
 
     private void showChannelsTab() {
         this.showingDirectMessages = false;
+        this.composingNewDm = false;
         this.selectedUserId = null;
         this.selectedUserName = null;
         this.channelRows.clear();
-        this.loadChannels();
+        this.init();
+        if (!this.loadingChannels) {
+            this.loadChannels();
+        }
         this.updateButtons();
     }
 
     private void showDirectMessagesTab() {
         this.showingDirectMessages = true;
+        this.composingNewDm = false;
         this.selectedChannel = null;
         this.messages.clear();
         this.rebuildMessageLines();
         this.userRows.clear();
-        this.loadUsers();
+        this.init();
+        if (!this.loadingChannels) {
+            this.loadUsers();
+        }
         this.updateButtons();
     }
 
@@ -751,7 +931,12 @@ public class ZulipBridgeScreen extends Screen {
             this.selectedUserName = null;
             this.messages.clear();
             this.rebuildMessageLines();
+            this.statusMessage = "Select a recipient from the member list or type an email.";
+            if (this.users.isEmpty() && !this.loadingChannels) {
+                this.loadUsers();
+            }
         }
+        this.init();
         this.updateButtons();
     }
 
@@ -766,6 +951,7 @@ public class ZulipBridgeScreen extends Screen {
         } else {
             this.polledChannels.add(channelName);
         }
+        this.persistPollSettings();
         this.updateButtons();
     }
 
@@ -787,7 +973,47 @@ public class ZulipBridgeScreen extends Screen {
             this.unreadChannels.clear();
             this.unreadDms.clear();
         }
+        this.persistPollSettings();
         this.updateButtons();
+    }
+
+    private void syncPollSettingsWithLoadedChannels() {
+        if (this.channels.isEmpty()) return;
+
+        if (this.pollAllConversations) {
+            this.polledChannels.clear();
+            for (ChannelEntry channel : this.channels) {
+                this.polledChannels.add(channel.name());
+            }
+        } else {
+            Set<String> availableChannels = new HashSet<>();
+            for (ChannelEntry channel : this.channels) {
+                availableChannels.add(channel.name());
+            }
+            this.polledChannels.removeIf(channelName -> !availableChannels.contains(channelName));
+        }
+
+        this.persistPollSettings();
+    }
+
+    private void persistPollSettings() {
+        synchronized (ZulipBridgeScreen.class) {
+            PERSISTED_POLL_ALL_CONVERSATIONS = false;
+            PERSISTED_POLLED_CHANNELS.clear();
+            PERSISTED_POLLED_CHANNELS.addAll(this.polledChannels);
+        }
+    }
+
+    public static boolean shouldReceiveIncomingStream(String streamName) {
+        synchronized (ZulipBridgeScreen.class) {
+            if (PERSISTED_POLLED_CHANNELS.isEmpty()) return true;
+            for (String configured : PERSISTED_POLLED_CHANNELS) {
+                if (configured.equalsIgnoreCase(streamName)) {
+                    return true;
+                }
+            }
+            return false;
+        }
     }
 
     private void pollAllConversationsAsync() {
@@ -967,6 +1193,7 @@ public class ZulipBridgeScreen extends Screen {
                     this.channels.clear();
                     this.channels.addAll(loadedChannels);
                     this.rebuildChannelRows();
+                    this.syncPollSettingsWithLoadedChannels();
                     this.channelScroll = clamp(this.channelScroll, 0, this.maxChannelScroll());
 
                     if (this.channels.isEmpty()) {
@@ -1085,6 +1312,7 @@ public class ZulipBridgeScreen extends Screen {
     private void loadUsers() {
         String validationError = validateAccountConfig(this.config);
         if (validationError != null) {
+            this.mentionUserLoadRequested = false;
             this.statusMessage = validationError;
             this.users.clear();
             this.userRows.clear();
@@ -1131,6 +1359,7 @@ public class ZulipBridgeScreen extends Screen {
 
                 this.runOnClient(() -> {
                     this.loadingChannels = false;
+                    this.mentionUserLoadRequested = false;
                     this.users.clear();
                     this.users.addAll(loadedUsers);
                     this.rebuildUserRows();
@@ -1140,6 +1369,7 @@ public class ZulipBridgeScreen extends Screen {
             } catch (Exception e) {
                 this.runOnClient(() -> {
                     this.loadingChannels = false;
+                    this.mentionUserLoadRequested = false;
                     this.users.clear();
                     this.userRows.clear();
                     this.statusMessage = "Failed to load users: " + e.getMessage();
@@ -1169,6 +1399,31 @@ public class ZulipBridgeScreen extends Screen {
         
         this.unreadDms.remove(userId);
         this.updateButtons();
+    }
+
+    private void selectRecipientForNewDm(String userId, String userName) {
+        UserEntry selectedUser = findUserById(userId);
+        if (selectedUser == null) {
+            this.selectUser(userId, userName);
+            return;
+        }
+
+        if (this.newRecipientField != null) {
+            String recipientValue = selectedUser.email() != null && !selectedUser.email().isBlank()
+                    ? selectedUser.email()
+                    : selectedUser.name();
+            this.newRecipientField.setText(recipientValue);
+        }
+
+        this.statusMessage = "Recipient selected: @" + userName;
+        this.updateButtons();
+    }
+
+    private UserEntry findUserById(String userId) {
+        for (UserEntry user : this.users) {
+            if (user.id().equals(userId)) return user;
+        }
+        return null;
     }
 
     private void loadDirectMessages(String userId) {

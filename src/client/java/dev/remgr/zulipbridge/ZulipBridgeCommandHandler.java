@@ -91,7 +91,8 @@ public final class ZulipBridgeCommandHandler {
         showLocalMessage(client, "Enabled: " + cfg.enabled() + ", Running: " + ZulipBridgeClient.isRunning());
         showLocalMessage(client, "Account: " + cfg.botEmail());
         showLocalMessage(client, "Command: /" + cfg.commandName().trim());
-        showLocalMessage(client, "Target: " + describeTarget());
+        showLocalMessage(client, "Outgoing target: " + describeTarget());
+        showLocalMessage(client, "Incoming feed: all subscribed channels + DMs");
         showLocalMessage(client, "Self-echo suppressed: " + cfg.suppressSelfEcho()
                 + ", Format: " + cfg.incomingMessageFormat());
         showLocalMessage(client, "Sound: " + cfg.playIncomingSound()
@@ -101,7 +102,7 @@ public final class ZulipBridgeCommandHandler {
     }
 
     public static void showTarget(MinecraftClient client) {
-        showLocalMessage(client, "Current target: " + describeTarget());
+        showLocalMessage(client, "Current outgoing target: " + describeTarget());
     }
 
     public static String describeTarget() {

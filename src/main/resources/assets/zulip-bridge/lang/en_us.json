@@ -11,26 +11,26 @@
   "text.config.zulip-bridge.section.stream":                "Stream / Topic",
 
   "text.config.zulip-bridge.option.streamName":             "Stream Name",
-  "text.config.zulip-bridge.option.streamName.tooltip":     "Name of the Zulip stream (channel) to bridge.",
+  "text.config.zulip-bridge.option.streamName.tooltip":     "Default stream used for outgoing messages when target is Stream.",
 
   "text.config.zulip-bridge.option.topicName":              "Topic Name",
-  "text.config.zulip-bridge.option.topicName.tooltip":      "Topic within the stream to bridge.",
+  "text.config.zulip-bridge.option.topicName.tooltip":      "Default topic used for outgoing messages when target is Stream.",
 
   "text.config.zulip-bridge.option.messageTarget":          "Message Target",
-  "text.config.zulip-bridge.option.messageTarget.tooltip":  "Choose whether the bridge uses a stream/topic or a direct-message conversation.",
+  "text.config.zulip-bridge.option.messageTarget.tooltip":  "Choose where outgoing Minecraft messages are sent.\nIncoming messages always use all subscribed channels and DMs.",
   "text.config.zulip-bridge.option.messageTarget.value.stream": "Stream",
   "text.config.zulip-bridge.option.messageTarget.value.direct_message": "Direct Message",
 
   "text.config.zulip-bridge.option.directMessageRecipients": "DM Recipients",
-  "text.config.zulip-bridge.option.directMessageRecipients.tooltip": "Comma-separated Zulip API email addresses for the DM conversation.\nDo not include your own email.",
+  "text.config.zulip-bridge.option.directMessageRecipients.tooltip": "Comma-separated Zulip API email addresses used for outgoing DMs.\nDo not include your own email.",
 
   "text.config.zulip-bridge.section.behaviour":             "Behaviour",
 
   "text.config.zulip-bridge.option.commandName":            "Command Name",
   "text.config.zulip-bridge.option.commandName.tooltip":    "Local Minecraft command used to send to Zulip.\nExample: 'zulip' means /zulip send hello.",
 
-  "text.config.zulip-bridge.option.pollIntervalSeconds":    "Poll Interval (seconds)",
-  "text.config.zulip-bridge.option.pollIntervalSeconds.tooltip": "How often to check Zulip for new messages.\nLower values are more responsive but use more API calls.",
+  "text.config.zulip-bridge.option.pollIntervalSeconds":    "Reconnect Delay (seconds)",
+  "text.config.zulip-bridge.option.pollIntervalSeconds.tooltip": "How long to wait before retrying after an event-stream error.\nLong polling is used for normal message delivery.",
 
   "text.config.zulip-bridge.option.enabled":                "Enabled",
   "text.config.zulip-bridge.option.enabled.tooltip":        "Enable or disable the bridge. Changes apply immediately while in-game.",
@@ -51,10 +51,10 @@
   "text.config.zulip-bridge.option.showIncomingPrefix.tooltip": "Show or hide the Zulip prefix/badge on incoming messages.\nOnly the sender color will be shown when disabled.",
 
   "text.config.zulip-bridge.option.senderColor":            "Sender Color",
-  "text.config.zulip-bridge.option.senderColor.tooltip":    "Hex color for incoming sender names.\nUse #RRGGBB, for example #3A9E5C.",
+  "text.config.zulip-bridge.option.senderColor.tooltip":    "Hex color for incoming sender names.\nUse #RRGGBB, for example #67FF67.",
 
   "text.config.zulip-bridge.option.messageColor":           "Message Color",
-  "text.config.zulip-bridge.option.messageColor.tooltip":   "Hex color for incoming message text.\nUse #RRGGBB, for example #50C878.",
+  "text.config.zulip-bridge.option.messageColor.tooltip":   "Hex color for incoming message text.\nUse #RRGGBB, for example #B5FFB5.",
 
   "text.config.zulip-bridge.option.incomingMessageFormat":  "Incoming Message Format",
   "text.config.zulip-bridge.option.incomingMessageFormat.tooltip": "Choose whether incoming Zulip messages are stripped to plain text or shown as raw Markdown.",
@@ -62,10 +62,10 @@
   "text.config.zulip-bridge.option.incomingMessageFormat.value.raw_markdown": "Raw Markdown",
 
   "text.config.zulip-bridge.option.playIncomingSound":      "Play Incoming Sound",
-  "text.config.zulip-bridge.option.playIncomingSound.tooltip": "Play a local Minecraft UI sound when a Zulip message arrives.",
+  "text.config.zulip-bridge.option.playIncomingSound.tooltip": "Play a local Minecraft UI sound when a direct message or mention arrives.",
 
   "text.config.zulip-bridge.option.showIncomingToast":      "Show Incoming Toast",
-  "text.config.zulip-bridge.option.showIncomingToast.tooltip": "Show a client-side toast notification when a Zulip message arrives.",
+  "text.config.zulip-bridge.option.showIncomingToast.tooltip": "Show an upper-right toast notification when a direct message or mention arrives.",
 
   "text.config.zulip-bridge.option.showSuccessfulSendMessages": "Show Successful Send Messages",
   "text.config.zulip-bridge.option.showSuccessfulSendMessages.tooltip": "Print a local chat line when a Zulip message is sent successfully. Failed sends are always shown.",

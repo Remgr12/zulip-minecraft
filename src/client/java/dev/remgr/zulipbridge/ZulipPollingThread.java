@@ -11,10 +11,8 @@ import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.ClickEvent;
 import net.minecraft.text.HoverEvent;
 import net.minecraft.text.Style;
-import net.minecraft.text.StyleSpriteSource;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
-import net.minecraft.util.Identifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -29,13 +27,14 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.function.BiConsumer;
 
 /**
- * Background thread that polls the Zulip REST API for new messages and
+ * Background thread that long-polls a Zulip event queue for new messages and
  * injects them into the Minecraft chat GUI.
  *
  * <p>One instance is started when the bridge is enabled, and stopped
@@ -45,19 +44,25 @@ public class ZulipPollingThread extends Thread {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("zulip-bridge/poll");
     private static final String DEFAULT_TEXT_PREFIX = "[Zulip] ";
-    private static final String IMAGE_PREFIX_GLYPH = "\uE000";
-    private static final Identifier IMAGE_PREFIX_FONT = Identifier.of("zulip-bridge", "zulip_prefix");
-    private static final StyleSpriteSource IMAGE_PREFIX_FONT_SOURCE = new StyleSpriteSource.Font(IMAGE_PREFIX_FONT);
-    private static final int DEFAULT_SENDER_COLOR = 0x3A9E5C;
-    private static final int DEFAULT_MESSAGE_COLOR = 0x50C878;
+    private static final int LEGACY_SENDER_COLOR = 0x3A9E5C;
+    private static final int LEGACY_MESSAGE_COLOR = 0x50C878;
+    private static final int DEFAULT_SENDER_COLOR = 0x67FF67;
+    private static final int DEFAULT_MESSAGE_COLOR = 0xB5FFB5;
+    private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(10);
+    private static final Duration EVENT_REQUEST_TIMEOUT = Duration.ofSeconds(120);
+    private static final Set<Long> CHAT_DM_SELF_ECHO_MESSAGE_IDS = new HashSet<>();
+
+    private record EventQueueState(String queueId, long lastEventId) {
+    }
+
+    private static final class QueueExpiredException extends Exception {
+        private QueueExpiredException(String message) {
+            super(message);
+        }
+    }
 
     private final ZulipBridgeConfig config;
     private volatile boolean running = true;
-    private String cachedDirectRecipients;
-    private int[] cachedDirectRecipientIds;
-
-    /** The highest message ID we have already displayed. -1 = not yet seeded. */
-    private long lastSeenId = -1;
 
     public ZulipPollingThread(ZulipBridgeConfig config) {
         super("ZulipBridgePollThread");
@@ -65,7 +70,7 @@ public class ZulipPollingThread extends Thread {
         setDaemon(true);
     }
 
-    /** Signal the thread to stop at the next sleep boundary. */
+    /** Signal the thread to stop at the next request boundary. */
     public void shutdown() {
         running = false;
         interrupt();
@@ -77,128 +82,287 @@ public class ZulipPollingThread extends Thread {
     public void run() {
         LOGGER.info("Zulip polling thread started.");
         HttpClient http = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(10))
+                .connectTimeout(REQUEST_TIMEOUT)
                 .build();
 
-        // Seed lastSeenId so we don't replay history on startup.
-        lastSeenId = fetchNewestId(http);
-        LOGGER.info("Seeded lastSeenId={}", lastSeenId);
+        EventQueueState queueState = null;
 
         while (running) {
             try {
-                int sleepMs = config.pollIntervalSeconds() * 1000;
-                Thread.sleep(sleepMs);
+                if (queueState == null) {
+                    queueState = registerEventQueue(http);
+                    LOGGER.info("Registered Zulip event queue {} (last_event_id={}).",
+                            queueState.queueId(), queueState.lastEventId());
+                }
+
+                queueState = pollEventsAndDisplay(http, queueState);
+            } catch (QueueExpiredException e) {
+                LOGGER.info("Event queue expired; re-registering: {}", e.getMessage());
+                queueState = null;
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
-            }
-
-            if (!running) break;
-
-            try {
-                pollAndDisplay(http);
             } catch (Exception e) {
-                LOGGER.warn("Poll error: {}", e.getMessage());
+                LOGGER.warn("Event polling error: {}", e.getMessage());
+                queueState = null;
+
+                try {
+                    int delaySeconds = Math.max(1, config.pollIntervalSeconds());
+                    Thread.sleep(delaySeconds * 1000L);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
             }
         }
 
         LOGGER.info("Zulip polling thread stopped.");
     }
 
-    // ── Polling ───────────────────────────────────────────────────────────────
+    // ── Event queue polling ───────────────────────────────────────────────────
 
-    private void pollAndDisplay(HttpClient http) throws Exception {
-        String narrowJson = buildNarrowJson(http);
-        long anchor = lastSeenId < 0 ? 0 : lastSeenId + 1;
-
-        String query = "anchor=" + anchor
-                + "&num_before=0"
-                + "&num_after=50"
-                + "&narrow=" + URLEncoder.encode(narrowJson, StandardCharsets.UTF_8)
+    private EventQueueState registerEventQueue(HttpClient http) throws Exception {
+        String form = "event_types=" + URLEncoder.encode("[\"message\"]", StandardCharsets.UTF_8)
+                + "&narrow=" + URLEncoder.encode("[]", StandardCharsets.UTF_8)
                 + "&apply_markdown=false"
                 + "&client_gravatar=false";
 
-        HttpRequest req = HttpRequest.newBuilder()
-                .uri(URI.create(config.zulipBaseUrl() + "/api/v1/messages?" + query))
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(config.zulipBaseUrl() + "/api/v1/register"))
                 .header("Authorization", buildAuthHeader())
-                .timeout(Duration.ofSeconds(10))
-                .GET()
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .timeout(REQUEST_TIMEOUT)
+                .POST(HttpRequest.BodyPublishers.ofString(form))
                 .build();
 
-        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> resp = http.send(request, HttpResponse.BodyHandlers.ofString());
         if (resp.statusCode() != 200) {
-            LOGGER.warn("Zulip poll HTTP {}: {}", resp.statusCode(), resp.body());
-            return;
+            throw new IllegalStateException("register HTTP " + resp.statusCode() + ": " + summarizeBody(resp.body()));
         }
 
         JsonObject body = JsonParser.parseString(resp.body()).getAsJsonObject();
         if (!"success".equals(body.get("result").getAsString())) {
-            LOGGER.warn("Zulip API error: {}", body.get("msg").getAsString());
-            return;
+            throw new IllegalStateException("register failed: " + body.get("msg").getAsString());
+        }
+        if (!body.has("queue_id") || !body.has("last_event_id")) {
+            throw new IllegalStateException("register response missing queue_id/last_event_id");
         }
 
-        JsonArray messages = body.getAsJsonArray("messages");
-        for (int i = 0; i < messages.size(); i++) {
-            JsonObject msg = messages.get(i).getAsJsonObject();
-            long id = msg.get("id").getAsLong();
-            if (id <= lastSeenId) continue;
-            lastSeenId = id;
+        return new EventQueueState(
+                body.get("queue_id").getAsString(),
+                body.get("last_event_id").getAsLong()
+        );
+    }
 
-            String sender  = msg.get("sender_full_name").getAsString();
-            String senderEmail = msg.has("sender_email") ? msg.get("sender_email").getAsString() : "";
-            if (shouldSuppressMessage(senderEmail)) continue;
+    private EventQueueState pollEventsAndDisplay(HttpClient http, EventQueueState queueState) throws Exception {
+        String query = "queue_id=" + URLEncoder.encode(queueState.queueId(), StandardCharsets.UTF_8)
+                + "&last_event_id=" + queueState.lastEventId()
+                + "&dont_block=false";
 
-            String content = formatIncomingContent(msg.get("content").getAsString());
-            displayInChat(sender, senderEmail, content);
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(config.zulipBaseUrl() + "/api/v1/events?" + query))
+                .header("Authorization", buildAuthHeader())
+                .timeout(EVENT_REQUEST_TIMEOUT)
+                .GET()
+                .build();
+
+        HttpResponse<String> resp = http.send(request, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200) {
+            JsonObject errorBody = parseJsonObjectOrNull(resp.body());
+            if (errorBody != null && errorBody.has("code")
+                    && "BAD_EVENT_QUEUE_ID".equals(errorBody.get("code").getAsString())) {
+                String message = errorBody.has("msg") ? errorBody.get("msg").getAsString() : "expired queue";
+                throw new QueueExpiredException(message);
+            }
+            throw new IllegalStateException("events HTTP " + resp.statusCode() + ": " + summarizeBody(resp.body()));
+        }
+
+        JsonObject body = JsonParser.parseString(resp.body()).getAsJsonObject();
+        if (!"success".equals(body.get("result").getAsString())) {
+            String code = body.has("code") ? body.get("code").getAsString() : "";
+            String message = body.has("msg") ? body.get("msg").getAsString() : "unknown error";
+            if ("BAD_EVENT_QUEUE_ID".equals(code)) {
+                throw new QueueExpiredException(message);
+            }
+            throw new IllegalStateException("events failed: " + message);
+        }
+
+        long lastEventId = queueState.lastEventId();
+        JsonArray events = body.has("events") && body.get("events").isJsonArray()
+                ? body.getAsJsonArray("events")
+                : new JsonArray();
+        for (int i = 0; i < events.size(); i++) {
+            JsonObject event = events.get(i).getAsJsonObject();
+            if (event.has("id")) {
+                lastEventId = Math.max(lastEventId, event.get("id").getAsLong());
+            }
+
+            if (!event.has("type") || !"message".equals(event.get("type").getAsString())) continue;
+            if (!event.has("message") || !event.get("message").isJsonObject()) continue;
+
+            handleIncomingMessage(event, event.getAsJsonObject("message"));
+        }
+
+        return new EventQueueState(queueState.queueId(), lastEventId);
+    }
+
+    private void handleIncomingMessage(JsonObject event, JsonObject message) {
+        String sourceLabel = describeIncomingSource(message);
+        String sender = message.has("sender_full_name") ? message.get("sender_full_name").getAsString() : "Zulip";
+        String senderEmail = message.has("sender_email") ? message.get("sender_email").getAsString() : "";
+        boolean selfMessage = isSelfMessage(senderEmail);
+        if (selfMessage && !shouldDisplaySelfMessage(message)) return;
+        if (!shouldDisplayIncomingMessage(message)) return;
+
+        String alertTitle = selfMessage ? null : buildAlertTitle(event, message, sourceLabel);
+        String content = message.has("content") ? formatIncomingContent(message.get("content").getAsString()) : "";
+        displayInChat(sourceLabel, sender, senderEmail, content, alertTitle);
+    }
+
+    private String buildAlertTitle(JsonObject event, JsonObject message, String sourceLabel) {
+        if (isDirectMessage(message)) {
+            return "Direct message";
+        }
+        if (hasMentionLikeFlag(event) || hasMentionLikeFlag(message)) {
+            String source = sourceLabel == null || sourceLabel.isBlank() ? "Zulip" : sourceLabel;
+            return "Mention in " + source;
+        }
+        return null;
+    }
+
+    private static boolean isDirectMessage(JsonObject message) {
+        return message.has("type") && "private".equals(message.get("type").getAsString());
+    }
+
+    private static boolean hasMentionLikeFlag(JsonObject payload) {
+        if (!payload.has("flags") || !payload.get("flags").isJsonArray()) return false;
+        JsonArray flags = payload.getAsJsonArray("flags");
+        for (int i = 0; i < flags.size(); i++) {
+            String flag = flags.get(i).getAsString();
+            if ("mentioned".equals(flag)
+                    || "wildcard_mentioned".equals(flag)
+                    || "stream_wildcard_mentioned".equals(flag)
+                    || "topic_wildcard_mentioned".equals(flag)
+                    || "has_alert_word".equals(flag)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isStreamMessage(JsonObject message) {
+        return message.has("type") && "stream".equals(message.get("type").getAsString());
+    }
+
+    private static String streamNameFromMessage(JsonObject message) {
+        if (!message.has("display_recipient") || !message.get("display_recipient").isJsonPrimitive()) {
+            return "";
+        }
+        return message.get("display_recipient").getAsString();
+    }
+
+    private static boolean shouldDisplayIncomingMessage(JsonObject message) {
+        if (!isStreamMessage(message)) return true;
+        String streamName = streamNameFromMessage(message);
+        return ZulipBridgeScreen.shouldReceiveIncomingStream(streamName);
+    }
+
+    private boolean isSelfMessage(String senderEmail) {
+        return senderEmail != null
+                && !senderEmail.isBlank()
+                && senderEmail.equalsIgnoreCase(config.botEmail());
+    }
+
+    private boolean shouldDisplaySelfMessage(JsonObject message) {
+        if (isDirectMessage(message)) {
+            long messageId = extractMessageId(message);
+            return messageId > 0 && consumeChatDmSelfEchoMessageId(messageId);
+        }
+        return !config.suppressSelfEcho();
+    }
+
+    private static long extractMessageId(JsonObject message) {
+        if (!message.has("id")) return -1;
+        try {
+            return message.get("id").getAsLong();
+        } catch (Exception ignored) {
+            return -1;
         }
     }
 
-    /** Fetch the ID of the most-recent message in the target topic. Returns 0 if empty. */
-    private long fetchNewestId(HttpClient http) {
-        try {
-            String narrowJson = buildNarrowJson(http);
-            String query = "anchor=newest&num_before=1&num_after=0"
-                    + "&narrow=" + URLEncoder.encode(narrowJson, StandardCharsets.UTF_8)
-                    + "&apply_markdown=false&client_gravatar=false";
-
-            HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create(config.zulipBaseUrl() + "/api/v1/messages?" + query))
-                    .header("Authorization", buildAuthHeader())
-                    .timeout(Duration.ofSeconds(10))
-                    .GET()
-                    .build();
-
-            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-            JsonObject body = JsonParser.parseString(resp.body()).getAsJsonObject();
-            if ("success".equals(body.get("result").getAsString())) {
-                JsonArray msgs = body.getAsJsonArray("messages");
-                if (!msgs.isEmpty()) {
-                    return msgs.get(msgs.size() - 1).getAsJsonObject().get("id").getAsLong();
-                }
-            }
-        } catch (Exception e) {
-            LOGGER.warn("Could not seed lastSeenId: {}", e.getMessage());
+    private static void allowChatDmSelfEchoMessageId(long messageId) {
+        synchronized (CHAT_DM_SELF_ECHO_MESSAGE_IDS) {
+            CHAT_DM_SELF_ECHO_MESSAGE_IDS.add(messageId);
         }
-        return 0;
+    }
+
+    private static boolean consumeChatDmSelfEchoMessageId(long messageId) {
+        synchronized (CHAT_DM_SELF_ECHO_MESSAGE_IDS) {
+            return CHAT_DM_SELF_ECHO_MESSAGE_IDS.remove(messageId);
+        }
+    }
+
+    private String describeIncomingSource(JsonObject message) {
+        String type = message.has("type") ? message.get("type").getAsString() : "";
+        if ("stream".equals(type)) {
+            String stream = message.has("display_recipient") && message.get("display_recipient").isJsonPrimitive()
+                    ? message.get("display_recipient").getAsString()
+                    : "unknown-stream";
+            String topic = message.has("subject")
+                    ? message.get("subject").getAsString()
+                    : (message.has("topic") ? message.get("topic").getAsString() : "");
+            return topic == null || topic.isBlank()
+                    ? "#" + stream
+                    : "#" + stream + " > " + topic;
+        }
+
+        if ("private".equals(type)) {
+            String recipients = describeDirectRecipients(message);
+            return recipients.isBlank() ? "DM" : "DM " + recipients;
+        }
+
+        return "Zulip";
+    }
+
+    private String describeDirectRecipients(JsonObject message) {
+        if (!message.has("display_recipient") || !message.get("display_recipient").isJsonArray()) {
+            return "";
+        }
+
+        JsonArray recipients = message.getAsJsonArray("display_recipient");
+        List<String> names = new ArrayList<>();
+        for (int i = 0; i < recipients.size(); i++) {
+            JsonObject recipient = recipients.get(i).getAsJsonObject();
+            String email = recipient.has("email") ? recipient.get("email").getAsString() : "";
+            if (!email.isBlank() && email.equalsIgnoreCase(config.botEmail())) continue;
+
+            String fullName = recipient.has("full_name") ? recipient.get("full_name").getAsString() : "";
+            if (fullName != null && !fullName.isBlank()) {
+                names.add(fullName);
+            } else if (!email.isBlank()) {
+                names.add(email);
+            }
+        }
+
+        if (names.isEmpty()) return "";
+        return "(" + String.join(", ", names) + ")";
     }
 
     // ── Chat display ──────────────────────────────────────────────────────────
 
-    private void displayInChat(String sender, String senderEmail, String content) {
+    private void displayInChat(String sourceLabel, String sender, String senderEmail, String content, String alertTitle) {
         boolean showPrefix = config.showIncomingPrefix();
         String prefix = normalizePrefix(config.incomingPrefix());
-        boolean useImagePrefix = DEFAULT_TEXT_PREFIX.equals(prefix);
-        int senderColor = parseHexColor(config.senderColor(), DEFAULT_SENDER_COLOR);
-        int messageColor = parseHexColor(config.messageColor(), DEFAULT_MESSAGE_COLOR);
+        int senderColor = resolveConfiguredSenderColor(config.senderColor());
+        int messageColor = resolveConfiguredMessageColor(config.messageColor());
 
         Style prefixStyle = Style.EMPTY
                 .withClickEvent(new ClickEvent.SuggestCommand("/zulip target show"))
                 .withHoverEvent(new HoverEvent.ShowText(
-                        Text.literal("Target: " + ZulipBridgeCommandHandler.describeTarget())));
+                        Text.literal("Incoming: all subscribed channels + DMs\nOutgoing target: "
+                                + ZulipBridgeCommandHandler.describeTarget())));
 
-        Text prefixText = useImagePrefix
-                ? Text.literal(IMAGE_PREFIX_GLYPH).setStyle(prefixStyle.withFont(IMAGE_PREFIX_FONT_SOURCE))
-                : Text.literal(prefix).setStyle(prefixStyle.withColor(Formatting.AQUA));
+        Text prefixText = Text.literal(prefix).setStyle(prefixStyle.withColor(Formatting.AQUA));
 
         Style senderStyle = Style.EMPTY.withColor(senderColor);
         if (senderEmail != null && !senderEmail.isBlank()) {
@@ -211,9 +375,9 @@ public class ZulipPollingThread extends Thread {
         var message = Text.empty().copy();
         if (showPrefix) {
             message.append(prefixText);
-            if (useImagePrefix) {
-                message.append(Text.literal(" "));
-            }
+        }
+        if (sourceLabel != null && !sourceLabel.isBlank()) {
+            message.append(Text.literal("[" + sourceLabel + "] ").setStyle(Style.EMPTY.withColor(Formatting.GRAY)));
         }
         message.append(Text.literal(sender).setStyle(senderStyle))
                 .append(Text.literal(": ").setStyle(Style.EMPTY.withColor(messageColor)))
@@ -225,15 +389,10 @@ public class ZulipPollingThread extends Thread {
             if (client.inGameHud != null) {
                 client.inGameHud.getChatHud().addMessage(message);
             }
-            notifyIncomingMessage(client, sender, content);
+            if (alertTitle != null) {
+                notifyIncomingMessage(client, alertTitle, sender, content);
+            }
         });
-    }
-
-    private boolean shouldSuppressMessage(String senderEmail) {
-        return config.suppressSelfEcho()
-                && senderEmail != null
-                && !senderEmail.isBlank()
-                && senderEmail.equalsIgnoreCase(config.botEmail());
     }
 
     private String formatIncomingContent(String content) {
@@ -248,8 +407,18 @@ public class ZulipPollingThread extends Thread {
     }
 
     private static String normalizePrefix(String prefix) {
-        if (prefix == null || prefix.isBlank()) return "[Zulip] ";
+        if (prefix == null || prefix.isBlank()) return DEFAULT_TEXT_PREFIX;
         return prefix.endsWith(" ") ? prefix : prefix + " ";
+    }
+
+    private static int resolveConfiguredSenderColor(String raw) {
+        int parsed = parseHexColor(raw, DEFAULT_SENDER_COLOR);
+        return parsed == LEGACY_SENDER_COLOR ? DEFAULT_SENDER_COLOR : parsed;
+    }
+
+    private static int resolveConfiguredMessageColor(String raw) {
+        int parsed = parseHexColor(raw, DEFAULT_MESSAGE_COLOR);
+        return parsed == LEGACY_MESSAGE_COLOR ? DEFAULT_MESSAGE_COLOR : parsed;
     }
 
     private static int parseHexColor(String raw, int fallback) {
@@ -281,20 +450,20 @@ public class ZulipPollingThread extends Thread {
         }
     }
 
-    private void notifyIncomingMessage(MinecraftClient client, String sender, String content) {
+    private void notifyIncomingMessage(MinecraftClient client, String alertTitle, String sender, String content) {
         if (config.playIncomingSound()) {
             client.getSoundManager().play(PositionedSoundInstance.ui(SoundEvents.UI_BUTTON_CLICK, 1.0f));
         }
 
-        if (config.showIncomingToast()) {
-            String description = content.length() > 120 ? content.substring(0, 117) + "..." : content;
-            SystemToast.add(
-                    client.getToastManager(),
-                    SystemToast.Type.PERIODIC_NOTIFICATION,
-                    Text.literal("Zulip: " + sender),
-                    Text.literal(description)
-            );
-        }
+        if (!config.showIncomingToast()) return;
+
+        String messagePreview = content.length() > 100 ? content.substring(0, 97) + "..." : content;
+        SystemToast.add(
+                client.getToastManager(),
+                SystemToast.Type.PERIODIC_NOTIFICATION,
+                Text.literal(alertTitle),
+                Text.literal(sender + ": " + messagePreview)
+        );
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -305,68 +474,19 @@ public class ZulipPollingThread extends Thread {
                 creds.getBytes(StandardCharsets.UTF_8));
     }
 
-    private String buildNarrowJson(HttpClient http) throws Exception {
-        if (config.messageTarget() == dev.remgr.zulipbridge.config.ZulipBridgeConfigModel.MessageTarget.DIRECT_MESSAGE) {
-            return "[{\"operator\":\"dm\",\"operand\":" + buildDirectRecipientIdsJson(http) + "}]";
+    private static JsonObject parseJsonObjectOrNull(String body) {
+        if (body == null || body.isBlank()) return null;
+        try {
+            return JsonParser.parseString(body).getAsJsonObject();
+        } catch (Exception ignored) {
+            return null;
         }
-
-        return "[{\"operator\":\"stream\",\"operand\":\""
-                + escapeJson(config.streamName()) + "\"},"
-                + "{\"operator\":\"topic\",\"operand\":\""
-                + escapeJson(config.topicName()) + "\"}]";
     }
 
-    private String buildDirectRecipientIdsJson(HttpClient http) throws Exception {
-        int[] recipients = resolveDirectRecipientIds(http);
-        StringBuilder builder = new StringBuilder("[");
-
-        for (int i = 0; i < recipients.length; i++) {
-            if (i > 0) builder.append(',');
-            builder.append(recipients[i]);
-        }
-
-        builder.append(']');
-        return builder.toString();
-    }
-
-    private int[] resolveDirectRecipientIds(HttpClient http) throws Exception {
-        String rawRecipients = config.directMessageRecipients();
-        if (rawRecipients != null && rawRecipients.equals(cachedDirectRecipients) && cachedDirectRecipientIds != null) {
-            return cachedDirectRecipientIds;
-        }
-
-        String[] recipients = parseDirectRecipients(rawRecipients);
-        int[] ids = new int[recipients.length];
-
-        for (int i = 0; i < recipients.length; i++) {
-            ids[i] = fetchUserIdByEmail(http, recipients[i]);
-        }
-
-        cachedDirectRecipients = rawRecipients;
-        cachedDirectRecipientIds = ids;
-        return ids;
-    }
-
-    private int fetchUserIdByEmail(HttpClient http, String email) throws Exception {
-        HttpRequest req = HttpRequest.newBuilder()
-                .uri(URI.create(config.zulipBaseUrl() + "/api/v1/users/" + URLEncoder.encode(email, StandardCharsets.UTF_8)
-                        + "?client_gravatar=false"))
-                .header("Authorization", buildAuthHeader())
-                .timeout(Duration.ofSeconds(10))
-                .GET()
-                .build();
-
-        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-        if (resp.statusCode() != 200) {
-            throw new IllegalStateException("Could not resolve Zulip user '" + email + "': HTTP " + resp.statusCode());
-        }
-
-        JsonObject body = JsonParser.parseString(resp.body()).getAsJsonObject();
-        if (!"success".equals(body.get("result").getAsString())) {
-            throw new IllegalStateException("Could not resolve Zulip user '" + email + "': " + body.get("msg").getAsString());
-        }
-
-        return body.getAsJsonObject("user").get("user_id").getAsInt();
+    private static String summarizeBody(String body) {
+        if (body == null || body.isBlank()) return "(empty body)";
+        String singleLine = body.replace('\n', ' ').replace('\r', ' ').trim();
+        return singleLine.length() > 200 ? singleLine.substring(0, 197) + "..." : singleLine;
     }
 
     private static String[] parseDirectRecipients(String raw) {
@@ -377,11 +497,6 @@ public class ZulipPollingThread extends Thread {
                 .filter(s -> !s.isEmpty())
                 .distinct()
                 .toArray(String[]::new);
-    }
-
-    /** Minimal JSON string escaping — only what we need for user-supplied strings. */
-    private static String escapeJson(String s) {
-        return s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
     // ── Static helper: send a message to Zulip ────────────────────────────────
@@ -448,6 +563,13 @@ public class ZulipPollingThread extends Thread {
                 if (!"success".equals(body.get("result").getAsString())) {
                     callback.accept(false, "Send failed: " + body.get("msg").getAsString());
                     return;
+                }
+
+                if (cfg.messageTarget() == dev.remgr.zulipbridge.config.ZulipBridgeConfigModel.MessageTarget.DIRECT_MESSAGE) {
+                    long sentMessageId = body.has("id") ? body.get("id").getAsLong() : -1;
+                    if (sentMessageId > 0) {
+                        allowChatDmSelfEchoMessageId(sentMessageId);
+                    }
                 }
 
                 callback.accept(true, "Sent to " + describeTarget(cfg) + ".");

@@ -33,18 +33,18 @@ public class ZulipBridgeConfigModel {
     // ── Target stream / topic ─────────────────────────────────────────────────
 
     @SectionHeader("stream")
-    /** Zulip stream (channel) name to bridge. */
+    /** Default Zulip stream (channel) used for outgoing messages. */
     public String streamName = "general";
 
-    /** Zulip topic within the stream to bridge. */
+    /** Default Zulip topic used for outgoing stream messages. */
     public String topicName = "minecraft";
 
-    /** Where messages should be sent and polled from. */
+    /** Where outgoing messages should be sent from Minecraft. */
     public MessageTarget messageTarget = MessageTarget.STREAM;
 
     /**
-     * Comma-separated Zulip API email addresses for a direct-message
-     * conversation. Do not include the current user's own email.
+     * Comma-separated Zulip API email addresses used when the outgoing
+     * message target is direct message. Do not include your own email.
      */
     public String directMessageRecipients = "";
 
@@ -57,7 +57,7 @@ public class ZulipBridgeConfigModel {
      */
     public String commandName = "zulip";
 
-    /** How often (in seconds) to poll Zulip for new messages. */
+    /** How long (in seconds) to wait before retrying after an event-stream error. */
     @RangeConstraint(min = 1, max = 60)
     public int pollIntervalSeconds = 2;
 
@@ -82,19 +82,19 @@ public class ZulipBridgeConfigModel {
     /** Whether to show the Zulip prefix/badge on incoming messages. */
     public boolean showIncomingPrefix = true;
 
-    /** Hex color for incoming sender names (for example, #3A9E5C). */
-    public String senderColor = "#3A9E5C";
+    /** Hex color for incoming sender names (for example, #67FF67). */
+    public String senderColor = "#67FF67";
 
-    /** Hex color for incoming message text (for example, #50C878). */
-    public String messageColor = "#50C878";
+    /** Hex color for incoming message text (for example, #B5FFB5). */
+    public String messageColor = "#B5FFB5";
 
     /** How incoming Zulip message content should be shown in Minecraft chat. */
     public IncomingMessageFormat incomingMessageFormat = IncomingMessageFormat.PLAIN_TEXT;
 
-    /** Whether to play a local sound when a Zulip message arrives. */
+    /** Whether to play a local sound when a direct message or mention arrives. */
     public boolean playIncomingSound = true;
 
-    /** Whether to show a toast notification when a Zulip message arrives. */
+    /** Whether to show an upper-right toast notification when a direct message or mention arrives. */
     public boolean showIncomingToast = false;
 
     /** Whether successful sends should print a local confirmation line in chat. */
