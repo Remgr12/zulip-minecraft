@@ -4,7 +4,8 @@
   "refmap": "client-zulip-bridge.refmap.json",
   "compatibilityLevel": "JAVA_21",
   "client": [
-    "ChatScreenMixin"
+    "ChatScreenMixin",
+    "ChatThumbnailRendererMixin"
   ],
   "injectors": {
     "defaultRequire": 1

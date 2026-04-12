@@ -142,6 +142,20 @@ public final class ZulipBridgeClientCommands {
                                 return Command.SINGLE_SUCCESS;
                             })));
 
+            // /zulip preview <hash>
+            root.then(ClientCommandManager.literal("preview")
+                    .then(ClientCommandManager.argument("hash", StringArgumentType.word())
+                            .executes(context -> {
+                                String hash = StringArgumentType.getString(context, "hash");
+                                var image = dev.remgr.zulipbridge.image.ImageCache.lookup(hash);
+                                if (image == null) {
+                                    ZulipBridgeCommandHandler.showLocalMessage(context.getSource().getClient(), "Image not loaded: " + hash);
+                                } else {
+                                    dev.remgr.zulipbridge.image.PreviewHud.show(hash);
+                                }
+                                return Command.SINGLE_SUCCESS;
+                            })));
+
             dispatcher.register(root);
         });
     }

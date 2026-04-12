@@ -4,6 +4,8 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import dev.remgr.zulipbridge.config.ZulipBridgeConfig;
+import dev.remgr.zulipbridge.image.ImageCache;
+import dev.remgr.zulipbridge.image.ImageRenderer;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.Click;
 import net.minecraft.client.gui.DrawContext;
@@ -28,10 +30,13 @@ import java.util.Base64;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * In-game browser for Zulip streams and recent messages.
@@ -51,9 +56,13 @@ public class ZulipBridgeScreen extends Screen {
     private static final int PANEL_GAP = 8;
     private static final int CHANNEL_ROW_HEIGHT = 12;
     private static final int MESSAGE_LINE_HEIGHT = 10;
+    private static final int GUI_IMAGE_MAX_SIZE = 72;
+    private static final int GUI_IMAGE_ROW_SPAN = 8;
     private static final int MAX_HISTORY_MESSAGES = 100;
     private static final int MAX_MENTION_SUGGESTIONS = 6;
     private static final int MENTION_SUGGESTION_ROW_HEIGHT = 14;
+    private static final Pattern MARKDOWN_LINK_PATTERN = Pattern.compile("\\[([^\\]]+)]\\(((?:[^()]|\\([^)]*\\))+?)\\)");
+    private static final Pattern USER_UPLOAD_PATH_PATTERN = Pattern.compile("^/user_uploads/([^/]+)/(.*)$");
     private static final Set<String> PERSISTED_POLLED_CHANNELS = new HashSet<>();
     private static boolean PERSISTED_POLL_ALL_CONVERSATIONS = false;
 
@@ -885,6 +894,22 @@ public class ZulipBridgeScreen extends Screen {
 
             DisplayLine line = this.renderedMessageLines.get(lineIndex);
             int y = lineTop + (i * MESSAGE_LINE_HEIGHT);
+            if (line.imageHash() != null) {
+                if (line.imageSpacer()) continue;
+
+                ImageCache.CachedImage image = ImageCache.lookup(line.imageHash());
+                int drawX = this.messagesX + 12;
+                if (image == null) {
+                    context.drawTextWithShadow(this.textRenderer, "[loading image]", drawX, y + 2, 0xFFAAAAAA);
+                    continue;
+                }
+
+                int maxWidth = Math.max(40, this.messagesWidth - 20);
+                ImageRenderer.Size size = ImageRenderer.fit(image.width(), image.height(), maxWidth, GUI_IMAGE_MAX_SIZE);
+                ImageRenderer.draw(context, image, drawX, y + 1, size);
+                continue;
+            }
+
             context.drawTextWithShadow(this.textRenderer, line.text(), this.messagesX + 4, y, line.color());
         }
     }
@@ -1282,7 +1307,7 @@ public class ZulipBridgeScreen extends Screen {
                             ? message.get("content").getAsString()
                             : "";
 
-                    loadedMessages.add(new ZulipMessage(id, sender, topic, content));
+                    loadedMessages.add(new ZulipMessage(id, sender, topic, content, collectMessageImageHashes(message, content)));
                 }
                 loadedMessages.sort(Comparator.comparingLong(ZulipMessage::id));
 
@@ -1501,7 +1526,7 @@ public class ZulipBridgeScreen extends Screen {
                             ? message.get("content").getAsString()
                             : "";
 
-                    loadedMessages.add(new ZulipMessage(id, sender, "", content));
+                    loadedMessages.add(new ZulipMessage(id, sender, "", content, collectMessageImageHashes(message, content)));
                 }
                 loadedMessages.sort(Comparator.comparingLong(ZulipMessage::id));
 
@@ -1893,6 +1918,13 @@ public class ZulipBridgeScreen extends Screen {
             for (String wrappedLine : wrappedContent) {
                 this.renderedMessageLines.add(new DisplayLine("  " + wrappedLine, 0xFFFFFFFF));
             }
+
+            for (String imageHash : message.imageHashes()) {
+                this.renderedMessageLines.add(DisplayLine.image(imageHash));
+                for (int i = 1; i < GUI_IMAGE_ROW_SPAN; i++) {
+                    this.renderedMessageLines.add(DisplayLine.imageSpacer(imageHash));
+                }
+            }
             this.renderedMessageLines.add(new DisplayLine("", 0xFFFFFFFF));
         }
 
@@ -2116,6 +2148,146 @@ public class ZulipBridgeScreen extends Screen {
         return "Basic " + Base64.getEncoder().encodeToString(creds.getBytes(StandardCharsets.UTF_8));
     }
 
+    private List<String> collectMessageImageHashes(JsonObject message, String content) {
+        LinkedHashSet<String> imageUrls = new LinkedHashSet<>();
+
+        Matcher matcher = MARKDOWN_LINK_PATTERN.matcher(content == null ? "" : content);
+        while (matcher.find()) {
+            String resolvedUrl = resolveMarkdownImageUrl(matcher.group(1), matcher.group(2));
+            if (resolvedUrl != null) imageUrls.add(resolvedUrl);
+        }
+
+        if (message.has("attachments") && message.get("attachments").isJsonArray()) {
+            JsonArray attachments = message.getAsJsonArray("attachments");
+            for (int i = 0; i < attachments.size(); i++) {
+                if (!attachments.get(i).isJsonObject()) continue;
+                JsonObject attachment = attachments.get(i).getAsJsonObject();
+                String url = attachment.has("url") ? attachment.get("url").getAsString() : "";
+                String contentType = attachment.has("content_type") ? attachment.get("content_type").getAsString() : "";
+                String fileName = attachment.has("name") ? attachment.get("name").getAsString() : "";
+                if (url.isBlank()) continue;
+                if (contentType.startsWith("image/") || looksLikeImageFile(fileName) || looksLikeImageFile(url)) {
+                    imageUrls.add(resolveImageUrl(url));
+                }
+            }
+        }
+
+        List<String> imageHashes = new ArrayList<>(imageUrls.size());
+        for (String imageUrl : imageUrls) {
+            String imageHash = ImageCache.hashUrl(imageUrl);
+            imageHashes.add(imageHash);
+            scheduleScreenImageLoad(imageHash, imageUrl);
+        }
+        return imageHashes;
+    }
+
+    private void scheduleScreenImageLoad(String imageHash, String imageUrl) {
+        if (ImageCache.lookup(imageHash) != null) return;
+
+        Thread.ofVirtual().name("ZulipBridgeGuiImage-" + imageHash).start(() -> {
+            try {
+                String downloadUrl = resolveImageDownloadUrl(imageUrl);
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(downloadUrl))
+                        .timeout(Duration.ofSeconds(10))
+                        .GET()
+                        .build();
+
+                HttpResponse<byte[]> response = this.httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
+                if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                    return;
+                }
+
+                byte[] bytes = response.body();
+                String contentType = response.headers().firstValue("Content-Type").orElse("");
+                boolean gif = contentType.toLowerCase(Locale.ROOT).endsWith("/gif") || imageUrl.toLowerCase(Locale.ROOT).endsWith(".gif");
+                MinecraftClient client = MinecraftClient.getInstance();
+                if (client == null) return;
+                client.execute(() -> ImageCache.getOrLoad(imageHash, bytes, imageUrl, gif));
+            } catch (Exception ignored) {
+            }
+        });
+    }
+
+    private String resolveImageDownloadUrl(String imageUrl) throws Exception {
+        URI uri = URI.create(imageUrl);
+        String rawPath = uri.getRawPath();
+        if (rawPath == null || rawPath.isBlank()) return imageUrl;
+
+        Matcher matcher = USER_UPLOAD_PATH_PATTERN.matcher(rawPath);
+        if (!matcher.matches()) return imageUrl;
+
+        String realmId = matcher.group(1);
+        String filename = matcher.group(2);
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(normalizeBaseUrl(this.config.zulipBaseUrl()) + "/api/v1/user_uploads/" + realmId + "/" + filename))
+                .header("Authorization", buildAuthHeader(this.config))
+                .timeout(Duration.ofSeconds(10))
+                .GET()
+                .build();
+
+        HttpResponse<String> response = this.httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            return imageUrl;
+        }
+
+        JsonObject body = JsonParser.parseString(response.body()).getAsJsonObject();
+        if (!"success".equals(body.get("result").getAsString()) || !body.has("url")) {
+            return imageUrl;
+        }
+        return resolveImageUrl(body.get("url").getAsString());
+    }
+
+    private String resolveMarkdownImageUrl(String label, String url) {
+        String normalizedUrl = normalizeMarkdownLinkUrl(url);
+        if (!looksLikeImageReference(label, normalizedUrl)) return null;
+        return resolveImageUrl(normalizedUrl);
+    }
+
+    private String resolveImageUrl(String imageUrl) {
+        if (imageUrl == null || imageUrl.isBlank()) return "";
+        if (imageUrl.startsWith("http://") || imageUrl.startsWith("https://")) return imageUrl;
+        String baseUrl = normalizeBaseUrl(this.config.zulipBaseUrl());
+        if (imageUrl.startsWith("/")) return baseUrl + imageUrl;
+        return baseUrl + "/" + imageUrl;
+    }
+
+    private static boolean looksLikeImageReference(String label, String url) {
+        if (looksLikeImageFile(label) || looksLikeImageFile(url)) {
+            return true;
+        }
+
+        String lowerUrl = url == null ? "" : url.toLowerCase(Locale.ROOT);
+        return lowerUrl.contains("/user_uploads/") && !lowerUrl.endsWith(".pdf");
+    }
+
+    private static boolean looksLikeImageFile(String value) {
+        if (value == null || value.isBlank()) return false;
+        String lower = value.toLowerCase(Locale.ROOT);
+        return lower.endsWith(".png")
+                || lower.endsWith(".jpg")
+                || lower.endsWith(".jpeg")
+                || lower.endsWith(".gif")
+                || lower.endsWith(".webp")
+                || lower.endsWith(".bmp");
+    }
+
+    private static String normalizeMarkdownLinkUrl(String url) {
+        if (url == null) return "";
+
+        String normalized = url.trim();
+        int titleSeparator = normalized.indexOf(" \"");
+        if (titleSeparator >= 0) {
+            normalized = normalized.substring(0, titleSeparator).trim();
+        }
+
+        if (normalized.startsWith("<") && normalized.endsWith(">") && normalized.length() > 2) {
+            normalized = normalized.substring(1, normalized.length() - 1).trim();
+        }
+
+        return normalized;
+    }
+
     private static String escapeJson(String input) {
         return input.replace("\\", "\\\\").replace("\"", "\\\"");
     }
@@ -2152,12 +2324,20 @@ public class ZulipBridgeScreen extends Screen {
     private record FolderInfo(String name, int order) {
     }
 
-    private record ZulipMessage(long id, String sender, String topic, String content) {
+    private record ZulipMessage(long id, String sender, String topic, String content, List<String> imageHashes) {
     }
 
-    private record DisplayLine(String text, int color, boolean bold, boolean italic, boolean code) {
+    private record DisplayLine(String text, int color, String imageHash, boolean imageSpacer) {
         DisplayLine(String text, int color) {
-            this(text, color, false, false, false);
+            this(text, color, null, false);
+        }
+
+        static DisplayLine image(String imageHash) {
+            return new DisplayLine("", 0xFFFFFFFF, imageHash, false);
+        }
+
+        static DisplayLine imageSpacer(String imageHash) {
+            return new DisplayLine("", 0xFFFFFFFF, imageHash, true);
         }
     }
 

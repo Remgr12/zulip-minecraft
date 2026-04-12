@@ -10,6 +10,8 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
 import net.minecraft.util.Identifier;
+import dev.remgr.zulipbridge.image.ImageCache;
+import dev.remgr.zulipbridge.chat.ChatImageRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.lwjgl.glfw.GLFW;
@@ -40,7 +42,14 @@ public class ZulipBridgeClient implements ClientModInitializer {
             }
         });
 
-        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> stopBridge());
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+            stopBridge();
+            ImageCache.clear();
+            ChatImageRegistry.clear();
+        });
+
+        // Register preview HUD overlay
+        net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback.EVENT.register(new dev.remgr.zulipbridge.image.PreviewHud());
     }
 
     // ── Bridge lifecycle ──────────────────────────────────────────────────────

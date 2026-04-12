@@ -15,12 +15,23 @@ import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import dev.remgr.zulipbridge.ZulipBridgeScreen;
+import dev.remgr.zulipbridge.ZulipBridgeCommandHandler;
+import dev.remgr.zulipbridge.image.ImageCache;
+import dev.remgr.zulipbridge.chat.ChatImageThumbnail;
+import dev.remgr.zulipbridge.chat.ChatImageRegistry;
+import java.util.regex.Pattern;
+import java.util.regex.Matcher;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.ArrayList;
 
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -51,6 +62,12 @@ public class ZulipPollingThread extends Thread {
     private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(10);
     private static final Duration EVENT_REQUEST_TIMEOUT = Duration.ofSeconds(120);
     private static final Set<Long> CHAT_DM_SELF_ECHO_MESSAGE_IDS = new HashSet<>();
+    private static final Pattern INLINE_IMAGE_PATTERN = Pattern.compile("<img\\s+[^>]*src=\"([^\"]+)\"[^>]*>", Pattern.CASE_INSENSITIVE);
+    private static final Pattern MARKDOWN_LINK_PATTERN = Pattern.compile("\\[([^\\]]+)]\\(((?:[^()]|\\([^)]*\\))+?)\\)");
+    private static final Pattern URL_PATTERN = Pattern.compile("((https?|ftp)://\\S+)");
+    private static final Pattern USER_UPLOAD_PATH_PATTERN = Pattern.compile("^/user_uploads/([^/]+)/(.*)$");
+    private static final String IMAGE_MARKER_PREFIX = "[[ZULIP_IMG:";
+    private static final String IMAGE_MARKER_SUFFIX = "]]";
 
     private record EventQueueState(String queueId, long lastEventId) {
     }
@@ -215,8 +232,11 @@ public class ZulipPollingThread extends Thread {
         if (!shouldDisplayIncomingMessage(message)) return;
 
         String alertTitle = selfMessage ? null : buildAlertTitle(event, message, sourceLabel);
-        String content = message.has("content") ? formatIncomingContent(message.get("content").getAsString()) : "";
-        displayInChat(sourceLabel, sender, senderEmail, content, alertTitle);
+        String rawContent = message.has("content") ? message.get("content").getAsString() : "";
+        String messageHash = buildMessageHash(message, sender, rawContent);
+        String contentWithImages = processImagesInContent(rawContent, rawContent, message, messageHash);
+        String content = formatIncomingContent(contentWithImages);
+        displayInChat(sourceLabel, sender, senderEmail, content, alertTitle, messageHash);
     }
 
     private String buildAlertTitle(JsonObject event, JsonObject message, String sourceLabel) {
@@ -350,7 +370,7 @@ public class ZulipPollingThread extends Thread {
 
     // ── Chat display ──────────────────────────────────────────────────────────
 
-    private void displayInChat(String sourceLabel, String sender, String senderEmail, String content, String alertTitle) {
+    private void displayInChat(String sourceLabel, String sender, String senderEmail, String content, String alertTitle, String messageHash) {
         boolean showPrefix = config.showIncomingPrefix();
         String prefix = normalizePrefix(config.incomingPrefix());
         int senderColor = resolveConfiguredSenderColor(config.senderColor());
@@ -381,12 +401,13 @@ public class ZulipPollingThread extends Thread {
         }
         message.append(Text.literal(sender).setStyle(senderStyle))
                 .append(Text.literal(": ").setStyle(Style.EMPTY.withColor(messageColor)))
-                .append(Text.literal(content).setStyle(Style.EMPTY.withColor(messageColor)));
+                .append(buildClickableContentText(content, messageColor));
 
         MinecraftClient client = MinecraftClient.getInstance();
         // Must be dispatched on the render thread to avoid threading issues.
         client.execute(() -> {
             if (client.inGameHud != null) {
+                ChatImageRegistry.bindDisplayText(messageHash, message);
                 client.inGameHud.getChatHud().addMessage(message);
             }
             if (alertTitle != null) {
@@ -409,6 +430,363 @@ public class ZulipPollingThread extends Thread {
     private static String normalizePrefix(String prefix) {
         if (prefix == null || prefix.isBlank()) return DEFAULT_TEXT_PREFIX;
         return prefix.endsWith(" ") ? prefix : prefix + " ";
+    }
+
+    // Build a Text component with clickable URL segments
+    private Text buildClickableContentText(String content, int color) {
+        int index = 0;
+        net.minecraft.text.MutableText result = Text.empty();
+        while (index < content.length()) {
+            int markerStart = content.indexOf(IMAGE_MARKER_PREFIX, index);
+            Matcher markdownImageMatcher = MARKDOWN_LINK_PATTERN.matcher(content);
+            boolean foundMarkdownImage = markdownImageMatcher.find(index);
+            int markdownImageStart = foundMarkdownImage && looksLikeImageReference(markdownImageMatcher.group(1), markdownImageMatcher.group(2))
+                    ? markdownImageMatcher.start()
+                    : -1;
+            Matcher urlMatcher = URL_PATTERN.matcher(content);
+            boolean foundUrl = urlMatcher.find(index);
+            int urlStart = foundUrl ? urlMatcher.start() : -1;
+
+            int nextStart = -1;
+            String tokenType = null;
+            if (markerStart >= 0) {
+                nextStart = markerStart;
+                tokenType = "marker";
+            }
+            if (markdownImageStart >= 0 && (nextStart < 0 || markdownImageStart < nextStart)) {
+                nextStart = markdownImageStart;
+                tokenType = "markdownImage";
+            }
+            if (urlStart >= 0 && (nextStart < 0 || urlStart < nextStart)) {
+                nextStart = urlStart;
+                tokenType = "url";
+            }
+
+            if (nextStart < 0) {
+                result.append(Text.literal(content.substring(index)).setStyle(Style.EMPTY.withColor(color)));
+                break;
+            }
+
+            if (nextStart > index) {
+                result.append(Text.literal(content.substring(index, nextStart)).setStyle(Style.EMPTY.withColor(color)));
+            }
+
+            if ("marker".equals(tokenType)) {
+                int markerEnd = content.indexOf(IMAGE_MARKER_SUFFIX, markerStart + IMAGE_MARKER_PREFIX.length());
+                if (markerEnd < 0) {
+                    result.append(Text.literal(content.substring(markerStart)).setStyle(Style.EMPTY.withColor(color)));
+                    break;
+                }
+
+                String imageHash = content.substring(markerStart + IMAGE_MARKER_PREFIX.length(), markerEnd);
+                appendImagePreviewToken(result, imageHash);
+                index = markerEnd + IMAGE_MARKER_SUFFIX.length();
+                continue;
+            }
+
+            if ("markdownImage".equals(tokenType)) {
+                String resolvedUrl = resolveMarkdownImageUrl(markdownImageMatcher.group(1), markdownImageMatcher.group(2));
+                if (resolvedUrl != null) {
+                    appendImagePreviewToken(result, resolveImageHash(resolvedUrl));
+                    index = markdownImageMatcher.end();
+                    continue;
+                }
+            }
+
+            String url = urlMatcher.group(1);
+            result.append(Text.literal(url).setStyle(Style.EMPTY.withColor(0x3366FF).withUnderline(true)
+                    .withClickEvent(new ClickEvent.OpenUrl(URI.create(url)))
+                    .withHoverEvent(new HoverEvent.ShowText(Text.literal("Open \"" + url + "\"")))));
+            index = urlMatcher.end();
+        }
+
+        return result;
+    }
+
+    private static void appendImagePreviewToken(net.minecraft.text.MutableText result, String imageHash) {
+        result.append(Text.literal(" "));
+        result.append(Text.literal("img").setStyle(Style.EMPTY.withColor(0x3366FF).withUnderline(true)
+                .withClickEvent(new ClickEvent.RunCommand("/zulip preview " + imageHash))
+                .withHoverEvent(new HoverEvent.ShowText(Text.literal("Click to preview")))));
+    }
+
+    private String processImagesInContent(String formattedContent, String rawHtml, JsonObject message, String messageHash) {
+        LinkedHashSet<String> imageUrls = collectImageUrls(rawHtml, message);
+        Matcher matcher = INLINE_IMAGE_PATTERN.matcher(formattedContent);
+        StringBuilder sb = new StringBuilder();
+        int last = 0;
+        LinkedHashSet<String> inlineUrls = new LinkedHashSet<>();
+
+        while (matcher.find()) {
+            String resolvedUrl = resolveImageUrl(matcher.group(1));
+            inlineUrls.add(resolvedUrl);
+            sb.append(formattedContent, last, matcher.start());
+            sb.append(imageMarker(resolveImageHash(resolvedUrl)));
+            scheduleImageLoad(messageHash, resolvedUrl);
+            last = matcher.end();
+        }
+
+        sb.append(formattedContent.substring(last));
+        String contentWithInlineImages = sb.toString();
+        String contentWithMarkdownImages = replaceMarkdownImageLinks(contentWithInlineImages, messageHash, inlineUrls);
+
+        for (String imageUrl : imageUrls) {
+            if (inlineUrls.contains(imageUrl)) continue;
+            contentWithMarkdownImages += ' ' + imageMarker(resolveImageHash(imageUrl));
+            scheduleImageLoad(messageHash, imageUrl);
+        }
+
+        return contentWithMarkdownImages;
+    }
+
+    private LinkedHashSet<String> collectImageUrls(String rawHtml, JsonObject message) {
+        LinkedHashSet<String> imageUrls = new LinkedHashSet<>();
+
+        Matcher matcher = INLINE_IMAGE_PATTERN.matcher(rawHtml == null ? "" : rawHtml);
+        while (matcher.find()) {
+            imageUrls.add(resolveImageUrl(matcher.group(1)));
+        }
+
+        Matcher markdownMatcher = MARKDOWN_LINK_PATTERN.matcher(rawHtml == null ? "" : rawHtml);
+        while (markdownMatcher.find()) {
+            String resolvedUrl = resolveMarkdownImageUrl(markdownMatcher.group(1), markdownMatcher.group(2));
+            if (resolvedUrl != null) imageUrls.add(resolvedUrl);
+        }
+
+        if (message.has("attachments") && message.get("attachments").isJsonArray()) {
+            JsonArray attachments = message.getAsJsonArray("attachments");
+            for (int i = 0; i < attachments.size(); i++) {
+                if (!attachments.get(i).isJsonObject()) continue;
+                JsonObject attachment = attachments.get(i).getAsJsonObject();
+                String url = attachment.has("url") ? attachment.get("url").getAsString() : "";
+                String contentType = attachment.has("content_type") ? attachment.get("content_type").getAsString() : "";
+                String fileName = attachment.has("name") ? attachment.get("name").getAsString() : "";
+                if (url.isBlank()) continue;
+                if (contentType.startsWith("image/") || looksLikeImageFile(fileName) || looksLikeImageFile(url)) {
+                    imageUrls.add(resolveImageUrl(url));
+                }
+            }
+        }
+
+        return imageUrls;
+    }
+
+    private void scheduleImageLoad(String messageHash, String imageUrl) {
+        String imageHash = resolveImageHash(imageUrl);
+        Thread.ofVirtual().name("ZulipImageDownload-" + messageHash + '-' + imageHash).start(() -> {
+            try {
+                HttpClient httpClient = HttpClient.newBuilder()
+                        .followRedirects(HttpClient.Redirect.NORMAL)
+                        .connectTimeout(REQUEST_TIMEOUT)
+                        .build();
+                String downloadUrl = resolveImageDownloadUrl(httpClient, imageUrl);
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(downloadUrl))
+                        .timeout(REQUEST_TIMEOUT)
+                        .GET()
+                        .build();
+
+                httpClient
+                        .sendAsync(request, HttpResponse.BodyHandlers.ofByteArray())
+                        .thenAccept(response -> {
+                            if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                                LOGGER.warn("Image download failed for {} (resolved to {}): HTTP {}", imageUrl, downloadUrl, response.statusCode());
+                                return;
+                            }
+
+                            byte[] bytes = response.body();
+                            String contentType = response.headers().firstValue("Content-Type").orElse("");
+                            boolean gif = contentType.toLowerCase().endsWith("/gif") || imageUrl.toLowerCase().endsWith(".gif");
+                            MinecraftClient.getInstance().execute(() -> {
+                                ImageCache.CachedImage image = ImageCache.getOrLoad(imageHash, bytes, imageUrl, gif);
+                                if (image == null) return;
+
+                                ChatImageRegistry.addThumbnail(
+                                        messageHash,
+                                        new ChatImageThumbnail(imageHash)
+                                );
+                            });
+                        })
+                        .exceptionally(throwable -> {
+                            LOGGER.warn("Image download failed for {}: {}", imageUrl, throwable.getMessage());
+                            return null;
+                        });
+            } catch (Exception e) {
+                LOGGER.warn("Image download failed for {}: {}", imageUrl, e.getMessage());
+            }
+        });
+    }
+
+    private String resolveImageDownloadUrl(HttpClient httpClient, String imageUrl) throws IOException, InterruptedException {
+        URI uri = URI.create(imageUrl);
+        String rawPath = uri.getRawPath();
+        if (rawPath == null || rawPath.isBlank()) return imageUrl;
+
+        String pathId = extractUserUploadPathId(rawPath);
+        if (pathId == null) {
+            pathId = lookupAttachmentPathId(httpClient, rawPath);
+        }
+        if (pathId == null) return imageUrl;
+
+        return fetchTemporaryUploadUrl(httpClient, pathId);
+    }
+
+    private static String extractUserUploadPathId(String rawPath) {
+        Matcher matcher = USER_UPLOAD_PATH_PATTERN.matcher(rawPath);
+        if (!matcher.matches()) return null;
+        return matcher.group(1) + "/" + matcher.group(2);
+    }
+
+    private String lookupAttachmentPathId(HttpClient httpClient, String rawPath) throws IOException, InterruptedException {
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(config.zulipBaseUrl() + "/api/v1/attachments"))
+                .header("Authorization", buildAuthHeader())
+                .timeout(REQUEST_TIMEOUT)
+                .GET()
+                .build();
+
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            throw new IOException("attachments HTTP " + response.statusCode());
+        }
+
+        JsonObject body = JsonParser.parseString(response.body()).getAsJsonObject();
+        if (!"success".equals(body.get("result").getAsString()) || !body.has("attachments") || !body.get("attachments").isJsonArray()) {
+            throw new IOException("attachments lookup failed: " + summarizeBody(response.body()));
+        }
+
+        JsonArray attachments = body.getAsJsonArray("attachments");
+        for (int i = 0; i < attachments.size(); i++) {
+            if (!attachments.get(i).isJsonObject()) continue;
+            JsonObject attachment = attachments.get(i).getAsJsonObject();
+            if (!attachment.has("path_id")) continue;
+
+            String pathId = attachment.get("path_id").getAsString();
+            if (rawPath.equals("/user_uploads/" + pathId)) {
+                return pathId;
+            }
+        }
+
+        return null;
+    }
+
+    private String fetchTemporaryUploadUrl(HttpClient httpClient, String pathId) throws IOException, InterruptedException {
+        int slash = pathId.indexOf('/');
+        if (slash <= 0 || slash == pathId.length() - 1) {
+            throw new IOException("invalid upload path id: " + pathId);
+        }
+
+        String realmId = pathId.substring(0, slash);
+        String filename = pathId.substring(slash + 1);
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(config.zulipBaseUrl() + "/api/v1/user_uploads/" + realmId + "/" + filename))
+                .header("Authorization", buildAuthHeader())
+                .timeout(REQUEST_TIMEOUT)
+                .GET()
+                .build();
+
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            throw new IOException("temporary upload URL HTTP " + response.statusCode());
+        }
+
+        JsonObject body = JsonParser.parseString(response.body()).getAsJsonObject();
+        if (!"success".equals(body.get("result").getAsString()) || !body.has("url")) {
+            throw new IOException("temporary upload URL lookup failed: " + summarizeBody(response.body()));
+        }
+
+        return resolveImageUrl(body.get("url").getAsString());
+    }
+
+    private String buildMessageHash(JsonObject message, String sender, String rawHtml) {
+        long messageId = extractMessageId(message);
+        if (messageId > 0) {
+            return Long.toUnsignedString(messageId, 16);
+        }
+        return Integer.toHexString((sender + '\n' + rawHtml).hashCode());
+    }
+
+    private String resolveImageHash(String imageUrl) {
+        return ImageCache.hashUrl(imageUrl);
+    }
+
+    private String resolveImageUrl(String imageUrl) {
+        if (imageUrl == null || imageUrl.isBlank()) return "";
+        if (imageUrl.startsWith("http://") || imageUrl.startsWith("https://")) return imageUrl;
+        if (imageUrl.startsWith("/")) return config.zulipBaseUrl() + imageUrl;
+        return config.zulipBaseUrl() + "/" + imageUrl;
+    }
+
+    private static boolean looksLikeImageFile(String value) {
+        if (value == null || value.isBlank()) return false;
+        String lower = value.toLowerCase();
+        return lower.endsWith(".png")
+                || lower.endsWith(".jpg")
+                || lower.endsWith(".jpeg")
+                || lower.endsWith(".gif")
+                || lower.endsWith(".webp")
+                || lower.endsWith(".bmp");
+    }
+
+    private String replaceMarkdownImageLinks(String content, String messageHash, Set<String> inlineUrls) {
+        Matcher matcher = MARKDOWN_LINK_PATTERN.matcher(content);
+        StringBuilder result = new StringBuilder();
+        int last = 0;
+
+        while (matcher.find()) {
+            String resolvedUrl = resolveMarkdownImageUrl(matcher.group(1), matcher.group(2));
+            if (resolvedUrl == null) {
+                continue;
+            }
+
+            inlineUrls.add(resolvedUrl);
+            result.append(content, last, matcher.start());
+            result.append(imageMarker(resolveImageHash(resolvedUrl)));
+            scheduleImageLoad(messageHash, resolvedUrl);
+            last = matcher.end();
+        }
+
+        if (last == 0) {
+            return content;
+        }
+
+        result.append(content.substring(last));
+        return result.toString();
+    }
+
+    private static boolean looksLikeImageReference(String label, String url) {
+        if (looksLikeImageFile(label) || looksLikeImageFile(url)) {
+            return true;
+        }
+
+        String lowerUrl = url == null ? "" : url.toLowerCase();
+        return lowerUrl.contains("/user_uploads/") && !lowerUrl.endsWith(".pdf");
+    }
+
+    private String resolveMarkdownImageUrl(String label, String url) {
+        String normalizedUrl = normalizeMarkdownLinkUrl(url);
+        if (!looksLikeImageReference(label, normalizedUrl)) return null;
+        return resolveImageUrl(normalizedUrl);
+    }
+
+    private static String normalizeMarkdownLinkUrl(String url) {
+        if (url == null) return "";
+
+        String normalized = url.trim();
+        int titleSeparator = normalized.indexOf(" \"");
+        if (titleSeparator >= 0) {
+            normalized = normalized.substring(0, titleSeparator).trim();
+        }
+
+        if (normalized.startsWith("<") && normalized.endsWith(">") && normalized.length() > 2) {
+            normalized = normalized.substring(1, normalized.length() - 1).trim();
+        }
+
+        return normalized;
+    }
+
+    private static String imageMarker(String imageHash) {
+        return IMAGE_MARKER_PREFIX + imageHash + IMAGE_MARKER_SUFFIX;
     }
 
     private static int resolveConfiguredSenderColor(String raw) {
