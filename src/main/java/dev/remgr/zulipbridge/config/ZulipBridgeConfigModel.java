@@ -16,7 +16,8 @@ public class ZulipBridgeConfigModel {
 
     public enum IncomingMessageFormat {
         PLAIN_TEXT,
-        RAW_MARKDOWN
+        RAW_MARKDOWN,
+        MARKDOWN
     }
 
     // ── Connection ────────────────────────────────────────────────────────────
@@ -79,7 +80,7 @@ public class ZulipBridgeConfigModel {
     /** Prefix prepended to incoming Zulip messages in the Minecraft chat. */
     public String incomingPrefix = "[Zulip] ";
 
-    /** Whether to show the Zulip prefix/badge on incoming messages. */
+    /** Whether to show the incoming Zulip text prefix on messages. */
     public boolean showIncomingPrefix = true;
 
     /** Hex color for incoming sender names (for example, #67FF67). */
@@ -89,7 +90,7 @@ public class ZulipBridgeConfigModel {
     public String messageColor = "#B5FFB5";
 
     /** How incoming Zulip message content should be shown in Minecraft chat. */
-    public IncomingMessageFormat incomingMessageFormat = IncomingMessageFormat.PLAIN_TEXT;
+    public IncomingMessageFormat incomingMessageFormat = IncomingMessageFormat.MARKDOWN;
 
     /** Whether to play a local sound when a direct message or mention arrives. */
     public boolean playIncomingSound = true;

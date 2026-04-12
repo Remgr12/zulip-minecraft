@@ -5,7 +5,7 @@
   "compatibilityLevel": "JAVA_21",
   "client": [
     "ChatScreenMixin",
-    "ChatThumbnailRendererMixin"
+    "ScreenPreviewOverlayMixin"
   ],
   "injectors": {
     "defaultRequire": 1

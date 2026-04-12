@@ -22,12 +22,17 @@ public final class ChatImageRegistry {
     private static final ArrayDeque<ChatHudLine.Visible> VISIBLE_LINE_ORDER = new ArrayDeque<>();
     private static final Map<String, ArrayDeque<String>> MESSAGE_HASHES_BY_LINE_TEXT = new HashMap<>();
     private static final ArrayDeque<String> LINE_TEXT_ORDER = new ArrayDeque<>();
+    private static final List<ThumbnailHitbox> THUMBNAIL_HITBOXES = new ArrayList<>();
 
     private ChatImageRegistry() {
     }
 
     public static synchronized void addThumbnail(String messageHash, ChatImageThumbnail thumbnail) {
-        THUMBNAILS_BY_MESSAGE.computeIfAbsent(messageHash, ignored -> new ArrayList<>()).add(thumbnail);
+        List<ChatImageThumbnail> thumbnails = THUMBNAILS_BY_MESSAGE.computeIfAbsent(messageHash, ignored -> new ArrayList<>());
+        boolean alreadyPresent = thumbnails.stream().anyMatch(existing -> existing.imageHash().equals(thumbnail.imageHash()));
+        if (!alreadyPresent) {
+            thumbnails.add(thumbnail);
+        }
     }
 
     public static synchronized void bindDisplayText(String messageHash, Text displayText) {
@@ -85,6 +90,25 @@ public final class ChatImageRegistry {
         return List.copyOf(thumbnails);
     }
 
+    public static synchronized void clearThumbnailHitboxes() {
+        THUMBNAIL_HITBOXES.clear();
+    }
+
+    public static synchronized void addThumbnailHitbox(String imageHash, int x, int y, int width, int height) {
+        if (imageHash == null || imageHash.isBlank() || width <= 0 || height <= 0) return;
+        THUMBNAIL_HITBOXES.add(new ThumbnailHitbox(imageHash, x, y, width, height));
+    }
+
+    public static synchronized String findThumbnailAt(double mouseX, double mouseY) {
+        for (int i = THUMBNAIL_HITBOXES.size() - 1; i >= 0; i--) {
+            ThumbnailHitbox hitbox = THUMBNAIL_HITBOXES.get(i);
+            if (hitbox.contains(mouseX, mouseY)) {
+                return hitbox.imageHash();
+            }
+        }
+        return null;
+    }
+
     public static synchronized void clear() {
         THUMBNAILS_BY_MESSAGE.clear();
         MESSAGE_BY_DISPLAY.clear();
@@ -93,6 +117,7 @@ public final class ChatImageRegistry {
         VISIBLE_LINE_ORDER.clear();
         MESSAGE_HASHES_BY_LINE_TEXT.clear();
         LINE_TEXT_ORDER.clear();
+        THUMBNAIL_HITBOXES.clear();
     }
 
     private static void trimDisplays() {
@@ -119,6 +144,12 @@ public final class ChatImageRegistry {
             if (messageHashes.isEmpty()) {
                 MESSAGE_HASHES_BY_LINE_TEXT.remove(oldestLineText);
             }
+        }
+    }
+
+    private record ThumbnailHitbox(String imageHash, int x, int y, int width, int height) {
+        private boolean contains(double mouseX, double mouseY) {
+            return mouseX >= x && mouseX < x + width && mouseY >= y && mouseY < y + height;
         }
     }
 }

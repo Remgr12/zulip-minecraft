@@ -4,16 +4,9 @@ import dev.remgr.zulipbridge.config.ZulipBridgeConfig;
 import dev.remgr.zulipbridge.config.ZulipBridgeConfigModel;
 import io.wispforest.owo.config.ui.ConfigScreenProviders;
 import net.minecraft.client.MinecraftClient;
-import net.minecraft.text.Style;
-import net.minecraft.text.StyleSpriteSource;
 import net.minecraft.text.Text;
-import net.minecraft.util.Identifier;
 
 public final class ZulipBridgeCommandHandler {
-
-    private static final String IMAGE_PREFIX_GLYPH = "\uE000";
-    private static final Identifier IMAGE_PREFIX_FONT = Identifier.of("zulip-bridge", "zulip_prefix");
-    private static final StyleSpriteSource IMAGE_PREFIX_FONT_SOURCE = new StyleSpriteSource.Font(IMAGE_PREFIX_FONT);
 
     private ZulipBridgeCommandHandler() {
     }
@@ -62,12 +55,7 @@ public final class ZulipBridgeCommandHandler {
 
     public static void showLocalMessage(MinecraftClient client, String message) {
         if (client.inGameHud == null) return;
-        client.inGameHud.getChatHud().addMessage(
-                Text.empty()
-                        .append(Text.literal(IMAGE_PREFIX_GLYPH).setStyle(Style.EMPTY.withFont(IMAGE_PREFIX_FONT_SOURCE)))
-                        .append(Text.literal(" "))
-                        .append(Text.literal(message))
-        );
+        client.inGameHud.getChatHud().addMessage(Text.literal(message));
     }
 
     public static void showHelp(MinecraftClient client, String commandName) {

@@ -6,6 +6,8 @@ import com.google.gson.JsonParser;
 import dev.remgr.zulipbridge.config.ZulipBridgeConfig;
 import dev.remgr.zulipbridge.image.ImageCache;
 import dev.remgr.zulipbridge.image.ImageRenderer;
+import dev.remgr.zulipbridge.image.PreviewHud;
+import dev.remgr.zulipbridge.text.EmojiShortcodes;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.Click;
 import net.minecraft.client.gui.DrawContext;
@@ -75,6 +77,7 @@ public class ZulipBridgeScreen extends Screen {
     private final List<ChannelListRow> userRows = new ArrayList<>();
     private final List<ZulipMessage> messages = new ArrayList<>();
     private final List<DisplayLine> renderedMessageLines = new ArrayList<>();
+    private final List<PreviewableImage> previewableImages = new ArrayList<>();
 
     private TextFieldWidget topicField;
     private TextFieldWidget messageField;
@@ -108,7 +111,7 @@ public class ZulipBridgeScreen extends Screen {
     private boolean mentionUserLoadRequested = false;
     private int channelScroll = 0;
     private int messageScroll = 0;
-    private final List<UserEntry> mentionSuggestions = new ArrayList<>();
+    private final List<AutocompleteSuggestion> mentionSuggestions = new ArrayList<>();
     private int mentionTokenStart = -1;
     private int mentionTokenEnd = -1;
     private int mentionSuggestionsX = 0;
@@ -544,47 +547,14 @@ public class ZulipBridgeScreen extends Screen {
         String text = this.messageField.getText();
         if (text == null || text.isBlank()) return;
 
-        int atIndex = text.lastIndexOf('@');
-        if (atIndex < 0) return;
+        int atIndex = findAutocompleteStart(text, '@');
+        int colonIndex = findAutocompleteStart(text, ':');
+        if (atIndex < 0 && colonIndex < 0) return;
 
-        int tokenEnd = atIndex + 1;
-        while (tokenEnd < text.length() && isMentionTokenChar(text.charAt(tokenEnd))) {
-            tokenEnd++;
-        }
-
-        if (tokenEnd != text.length()) return;
-
-        String query = text.substring(atIndex + 1, tokenEnd).trim();
-        if (query.startsWith("**")) return;
-
-        if (this.users.isEmpty()) {
-            if (!this.loadingChannels && !this.mentionUserLoadRequested) {
-                this.mentionUserLoadRequested = true;
-                this.loadUsers();
-            }
-            return;
-        }
-
-        this.mentionTokenStart = atIndex;
-        this.mentionTokenEnd = tokenEnd;
-        String normalizedQuery = query.toLowerCase(Locale.ROOT);
-
-        for (UserEntry user : this.users) {
-            String userName = user.name() == null ? "" : user.name();
-            String userEmail = user.email() == null ? "" : user.email();
-            String lowerName = userName.toLowerCase(Locale.ROOT);
-            String lowerEmail = userEmail.toLowerCase(Locale.ROOT);
-
-            if (normalizedQuery.isEmpty()
-                    || lowerName.startsWith(normalizedQuery)
-                    || lowerName.contains(normalizedQuery)
-                    || (!userEmail.isBlank() && lowerEmail.startsWith(normalizedQuery))
-                    || (!userEmail.isBlank() && lowerEmail.contains(normalizedQuery))) {
-                this.mentionSuggestions.add(user);
-                if (this.mentionSuggestions.size() >= MAX_MENTION_SUGGESTIONS) {
-                    break;
-                }
-            }
+        if (colonIndex > atIndex) {
+            populateEmojiSuggestions(text, colonIndex);
+        } else {
+            populateUserSuggestions(text, atIndex);
         }
     }
 
@@ -608,18 +578,14 @@ public class ZulipBridgeScreen extends Screen {
 
         int rowY = panelY + 4;
         for (int i = 0; i < this.mentionSuggestions.size(); i++) {
-            UserEntry user = this.mentionSuggestions.get(i);
+            AutocompleteSuggestion suggestion = this.mentionSuggestions.get(i);
             boolean hovered = mouseX >= panelX + 1 && mouseX < panelX + panelWidth - 1
                     && mouseY >= rowY && mouseY < rowY + MENTION_SUGGESTION_ROW_HEIGHT;
             if (hovered) {
                 context.fill(panelX + 1, rowY, panelX + panelWidth - 1, rowY + MENTION_SUGGESTION_ROW_HEIGHT, 0x553A3A49);
             }
 
-            String label = "@" + user.name();
-            if (user.email() != null && !user.email().isBlank()) {
-                label += " <" + user.email() + ">";
-            }
-            String trimmedLabel = this.textRenderer.trimToWidth(label, panelWidth - 8);
+            String trimmedLabel = this.textRenderer.trimToWidth(suggestion.label(), panelWidth - 8);
             context.drawTextWithShadow(this.textRenderer, trimmedLabel, panelX + 4, rowY + 2, 0xFFE8E8E8);
             rowY += MENTION_SUGGESTION_ROW_HEIGHT;
         }
@@ -643,7 +609,7 @@ public class ZulipBridgeScreen extends Screen {
         return true;
     }
 
-    private void applyMentionSuggestion(UserEntry user) {
+    private void applyMentionSuggestion(AutocompleteSuggestion suggestion) {
         if (this.messageField == null || this.mentionTokenStart < 0 || this.mentionTokenEnd < this.mentionTokenStart) return;
 
         String text = this.messageField.getText();
@@ -652,7 +618,7 @@ public class ZulipBridgeScreen extends Screen {
         int safeEnd = Math.min(this.mentionTokenEnd, text.length());
         String prefix = text.substring(0, this.mentionTokenStart);
         String suffix = text.substring(safeEnd);
-        String mention = "@**" + user.name() + "**";
+        String mention = suggestion.insertText();
 
         if (suffix.isEmpty()) {
             suffix = " ";
@@ -675,14 +641,29 @@ public class ZulipBridgeScreen extends Screen {
 
     @Override
     public boolean mouseClicked(Click click, boolean doubleClick) {
-        if (super.mouseClicked(click, doubleClick)) return true;
-
         double mouseX = click.x();
         double mouseY = click.y();
         int button = click.button();
 
+        if (PreviewHud.isActive()) {
+            if (button == 0) {
+                PreviewHud.handleClick(mouseX, mouseY);
+            }
+            return true;
+        }
+
+        if (super.mouseClicked(click, doubleClick)) return true;
+
         if (button == 0 && this.handleMentionSuggestionClick((int) mouseX, (int) mouseY)) {
             return true;
+        }
+
+        if (button == 0) {
+            String imageHash = findPreviewableImageAt((int) mouseX, (int) mouseY);
+            if (imageHash != null) {
+                PreviewHud.show(imageHash);
+                return true;
+            }
         }
 
         if (button == 0 && isInsideChannels(mouseX, mouseY)) {
@@ -760,10 +741,16 @@ public class ZulipBridgeScreen extends Screen {
     @Override
     public boolean keyPressed(KeyInput keyInput) {
         int keyCode = keyInput.key();
-        if (keyCode == GLFW.GLFW_KEY_TAB
-                && this.messageField != null
+        boolean acceptingSuggestion = this.messageField != null
                 && this.messageField.isFocused()
-                && !this.mentionSuggestions.isEmpty()) {
+                && !this.mentionSuggestions.isEmpty();
+
+        if (keyCode == GLFW.GLFW_KEY_TAB && acceptingSuggestion) {
+            this.applyMentionSuggestion(this.mentionSuggestions.getFirst());
+            return true;
+        }
+
+        if ((keyCode == GLFW.GLFW_KEY_ENTER || keyCode == GLFW.GLFW_KEY_KP_ENTER) && acceptingSuggestion) {
             this.applyMentionSuggestion(this.mentionSuggestions.getFirst());
             return true;
         }
@@ -776,6 +763,95 @@ public class ZulipBridgeScreen extends Screen {
         }
 
         return super.keyPressed(keyInput);
+    }
+
+    private void populateUserSuggestions(String text, int atIndex) {
+        if (atIndex < 0) return;
+
+        int tokenEnd = atIndex + 1;
+        while (tokenEnd < text.length() && isMentionTokenChar(text.charAt(tokenEnd))) {
+            tokenEnd++;
+        }
+
+        if (tokenEnd != text.length()) return;
+
+        String query = text.substring(atIndex + 1, tokenEnd).trim();
+        if (query.startsWith("**")) return;
+
+        if (this.users.isEmpty()) {
+            if (!this.loadingChannels && !this.mentionUserLoadRequested) {
+                this.mentionUserLoadRequested = true;
+                this.loadUsers();
+            }
+            return;
+        }
+
+        this.mentionTokenStart = atIndex;
+        this.mentionTokenEnd = tokenEnd;
+        String normalizedQuery = query.toLowerCase(Locale.ROOT);
+
+        for (UserEntry user : this.users) {
+            String userName = user.name() == null ? "" : user.name();
+            String userEmail = user.email() == null ? "" : user.email();
+            String lowerName = userName.toLowerCase(Locale.ROOT);
+            String lowerEmail = userEmail.toLowerCase(Locale.ROOT);
+
+            if (normalizedQuery.isEmpty()
+                    || lowerName.startsWith(normalizedQuery)
+                    || lowerName.contains(normalizedQuery)
+                    || (!userEmail.isBlank() && lowerEmail.startsWith(normalizedQuery))
+                    || (!userEmail.isBlank() && lowerEmail.contains(normalizedQuery))) {
+                String label = "@" + user.name();
+                if (user.email() != null && !user.email().isBlank()) {
+                    label += " <" + user.email() + ">";
+                }
+                this.mentionSuggestions.add(new AutocompleteSuggestion(label, "@**" + user.name() + "**"));
+                if (this.mentionSuggestions.size() >= MAX_MENTION_SUGGESTIONS) {
+                    break;
+                }
+            }
+        }
+    }
+
+    private void populateEmojiSuggestions(String text, int colonIndex) {
+        if (colonIndex < 0) return;
+        if (colonIndex < text.length() - 1 && text.endsWith(":")) return;
+
+        int tokenEnd = colonIndex + 1;
+        while (tokenEnd < text.length() && isEmojiTokenChar(text.charAt(tokenEnd))) {
+            tokenEnd++;
+        }
+
+        if (tokenEnd != text.length()) return;
+
+        String query = text.substring(colonIndex + 1, tokenEnd).trim().toLowerCase(Locale.ROOT);
+        this.mentionTokenStart = colonIndex;
+        this.mentionTokenEnd = tokenEnd;
+
+        for (String shortcode : EmojiShortcodes.suggest(query, MAX_MENTION_SUGGESTIONS)) {
+            String emoji = EmojiShortcodes.get(shortcode);
+            String label = (emoji == null || emoji.isBlank() ? "" : emoji + " ") + ":" + shortcode + ":";
+            this.mentionSuggestions.add(new AutocompleteSuggestion(label, ":" + shortcode + ":"));
+        }
+    }
+
+    private static int findAutocompleteStart(String text, char marker) {
+        int markerIndex = text.lastIndexOf(marker);
+        if (markerIndex < 0) return -1;
+        if (markerIndex > 0) {
+            char previous = text.charAt(markerIndex - 1);
+            if (!Character.isWhitespace(previous) && previous != '(' && previous != '[') {
+                return -1;
+            }
+        }
+        return markerIndex;
+    }
+
+    private static boolean isEmojiTokenChar(char character) {
+        return Character.isLetterOrDigit(character)
+                || character == '_'
+                || character == '-'
+                || character == '+';
     }
 
     private void recalculateLayout() {
@@ -867,6 +943,7 @@ public class ZulipBridgeScreen extends Screen {
     private void drawMessagesPanel(DrawContext context) {
         int x2 = this.messagesX + this.messagesWidth;
         int y2 = this.messagesY + this.messagesHeight;
+        this.previewableImages.clear();
 
         context.fill(this.messagesX, this.messagesY, x2, y2, 0xAA101015);
         drawBorder(context, this.messagesX, this.messagesY, this.messagesWidth, this.messagesHeight, 0xFF2F2F3F);
@@ -907,6 +984,7 @@ public class ZulipBridgeScreen extends Screen {
                 int maxWidth = Math.max(40, this.messagesWidth - 20);
                 ImageRenderer.Size size = ImageRenderer.fit(image.width(), image.height(), maxWidth, GUI_IMAGE_MAX_SIZE);
                 ImageRenderer.draw(context, image, drawX, y + 1, size);
+                this.previewableImages.add(new PreviewableImage(line.imageHash(), drawX, y + 1, size.width(), size.height()));
                 continue;
             }
 
@@ -1307,7 +1385,7 @@ public class ZulipBridgeScreen extends Screen {
                             ? message.get("content").getAsString()
                             : "";
 
-                    loadedMessages.add(new ZulipMessage(id, sender, topic, content, collectMessageImageHashes(message, content)));
+                    loadedMessages.add(new ZulipMessage(id, sender, topic, EmojiShortcodes.replace(stripMarkdownImageLinks(content)), collectMessageImageHashes(message, content)));
                 }
                 loadedMessages.sort(Comparator.comparingLong(ZulipMessage::id));
 
@@ -1526,7 +1604,7 @@ public class ZulipBridgeScreen extends Screen {
                             ? message.get("content").getAsString()
                             : "";
 
-                    loadedMessages.add(new ZulipMessage(id, sender, "", content, collectMessageImageHashes(message, content)));
+                    loadedMessages.add(new ZulipMessage(id, sender, "", EmojiShortcodes.replace(stripMarkdownImageLinks(content)), collectMessageImageHashes(message, content)));
                 }
                 loadedMessages.sort(Comparator.comparingLong(ZulipMessage::id));
 
@@ -1912,11 +1990,15 @@ public class ZulipBridgeScreen extends Screen {
             }
 
             String formatted = applyFormattingCodes(message.content());
-            if (formatted.isBlank()) formatted = "(no content)";
+            if (formatted.isBlank() && message.imageHashes().isEmpty()) {
+                formatted = "(no content)";
+            }
 
-            List<String> wrappedContent = wrapText(formatted, Math.max(20, maxLineWidth - 10));
-            for (String wrappedLine : wrappedContent) {
-                this.renderedMessageLines.add(new DisplayLine("  " + wrappedLine, 0xFFFFFFFF));
+            if (!formatted.isBlank()) {
+                List<String> wrappedContent = wrapText(formatted, Math.max(20, maxLineWidth - 10));
+                for (String wrappedLine : wrappedContent) {
+                    this.renderedMessageLines.add(new DisplayLine("  " + wrappedLine, 0xFFFFFFFF));
+                }
             }
 
             for (String imageHash : message.imageHashes()) {
@@ -2303,6 +2385,33 @@ public class ZulipBridgeScreen extends Screen {
                 .trim();
     }
 
+    private String stripMarkdownImageLinks(String content) {
+        if (content == null || content.isEmpty()) return "";
+
+        Matcher matcher = MARKDOWN_LINK_PATTERN.matcher(content);
+        StringBuilder result = new StringBuilder();
+        int last = 0;
+        while (matcher.find()) {
+            String resolvedUrl = resolveMarkdownImageUrl(matcher.group(1), matcher.group(2));
+            if (resolvedUrl == null) {
+                continue;
+            }
+
+            result.append(content, last, matcher.start());
+            last = matcher.end();
+        }
+
+        if (last == 0) {
+            return content;
+        }
+
+        result.append(content.substring(last));
+        return result.toString()
+                .replaceAll("(?m)[ \t]+$", "")
+                .replaceAll("\n{3,}", "\n\n")
+                .trim();
+    }
+
     private static String extractApiMessage(String body) {
         if (body == null || body.isBlank()) return "Unknown API response";
         try {
@@ -2313,6 +2422,16 @@ public class ZulipBridgeScreen extends Screen {
         } catch (Exception ignored) {
         }
         return body.length() > 160 ? body.substring(0, 157) + "..." : body;
+    }
+
+    private String findPreviewableImageAt(int mouseX, int mouseY) {
+        for (int i = this.previewableImages.size() - 1; i >= 0; i--) {
+            PreviewableImage image = this.previewableImages.get(i);
+            if (image.contains(mouseX, mouseY)) {
+                return image.imageHash();
+            }
+        }
+        return null;
     }
 
     private record ChannelEntry(String name, String folderName, int folderOrder, boolean pinned, boolean muted) {
@@ -2345,6 +2464,15 @@ public class ZulipBridgeScreen extends Screen {
     }
 
     private record NewMessageInfo(String source, String sender, String content) {
+    }
+
+    private record PreviewableImage(String imageHash, int x, int y, int width, int height) {
+        private boolean contains(int mouseX, int mouseY) {
+            return mouseX >= x && mouseX < x + width && mouseY >= y && mouseY < y + height;
+        }
+    }
+
+    private record AutocompleteSuggestion(String label, String insertText) {
     }
 
     private void displayMessagesInChat(List<NewMessageInfo> messages) {

@@ -4,6 +4,8 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import dev.remgr.zulipbridge.config.ZulipBridgeConfig;
+import dev.remgr.zulipbridge.image.ImageCache;
+import dev.remgr.zulipbridge.text.EmojiShortcodes;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.sound.PositionedSoundInstance;
 import net.minecraft.client.toast.SystemToast;
@@ -15,11 +17,7 @@ import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import dev.remgr.zulipbridge.ZulipBridgeScreen;
-import dev.remgr.zulipbridge.ZulipBridgeCommandHandler;
-import dev.remgr.zulipbridge.image.ImageCache;
-import dev.remgr.zulipbridge.chat.ChatImageThumbnail;
-import dev.remgr.zulipbridge.chat.ChatImageRegistry;
+
 import java.util.regex.Pattern;
 import java.util.regex.Matcher;
 import java.util.Map;
@@ -34,7 +32,6 @@ import java.net.http.HttpResponse;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Comparator;
@@ -62,12 +59,24 @@ public class ZulipPollingThread extends Thread {
     private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(10);
     private static final Duration EVENT_REQUEST_TIMEOUT = Duration.ofSeconds(120);
     private static final Set<Long> CHAT_DM_SELF_ECHO_MESSAGE_IDS = new HashSet<>();
-    private static final Pattern INLINE_IMAGE_PATTERN = Pattern.compile("<img\\s+[^>]*src=\"([^\"]+)\"[^>]*>", Pattern.CASE_INSENSITIVE);
-    private static final Pattern MARKDOWN_LINK_PATTERN = Pattern.compile("\\[([^\\]]+)]\\(((?:[^()]|\\([^)]*\\))+?)\\)");
-    private static final Pattern URL_PATTERN = Pattern.compile("((https?|ftp)://\\S+)");
-    private static final Pattern USER_UPLOAD_PATH_PATTERN = Pattern.compile("^/user_uploads/([^/]+)/(.*)$");
     private static final String IMAGE_MARKER_PREFIX = "[[ZULIP_IMG:";
     private static final String IMAGE_MARKER_SUFFIX = "]]";
+    private static final Pattern IMAGE_MARKER_PATTERN = Pattern.compile(Pattern.quote(IMAGE_MARKER_PREFIX) + "([^\\]]+)" + Pattern.quote(IMAGE_MARKER_SUFFIX));
+    private static final Pattern MARKDOWN_LINK_PATTERN = Pattern.compile("\\[([^\\]]+)]\\(((?:[^()]|\\([^)]*\\))+?)\\)");
+    private static final Pattern MARKDOWN_HEADING_PATTERN = Pattern.compile("^(#{1,6})\\s+(.*)$");
+    private static final Pattern MARKDOWN_QUOTE_PATTERN = Pattern.compile("^>\\s?(.*)$");
+    private static final Pattern MARKDOWN_LIST_PATTERN = Pattern.compile("^(\\s*)([-*+]\\s+|\\d+\\.\\s+)(.*)$");
+    private static final Pattern MARKDOWN_INLINE_TOKEN_PATTERN = Pattern.compile(
+            Pattern.quote(IMAGE_MARKER_PREFIX) + "([^\\]]+)" + Pattern.quote(IMAGE_MARKER_SUFFIX)
+                    + "|\\[([^\\]]+)]\\(((?:[^()]|\\([^)]*\\))+?)\\)"
+                    + "|`([^`]+)`"
+                    + "|\\*\\*([^*]+)\\*\\*"
+                    + "|~~([^~]+)~~"
+                    + "|\\*([^*]+)\\*"
+                    + "|((https?|ftp)://\\S+)"
+    );
+    private static final Pattern URL_PATTERN = Pattern.compile("((https?|ftp)://\\S+)");
+    private static final Pattern USER_UPLOAD_PATH_PATTERN = Pattern.compile("^/user_uploads/([^/]+)/(.*)$");
 
     private record EventQueueState(String queueId, long lastEventId) {
     }
@@ -234,9 +243,8 @@ public class ZulipPollingThread extends Thread {
         String alertTitle = selfMessage ? null : buildAlertTitle(event, message, sourceLabel);
         String rawContent = message.has("content") ? message.get("content").getAsString() : "";
         String messageHash = buildMessageHash(message, sender, rawContent);
-        String contentWithImages = processImagesInContent(rawContent, rawContent, message, messageHash);
-        String content = formatIncomingContent(contentWithImages);
-        displayInChat(sourceLabel, sender, senderEmail, content, alertTitle, messageHash);
+        String contentWithImages = processImagesInContent(rawContent, message, messageHash);
+        displayInChat(sourceLabel, sender, senderEmail, contentWithImages, alertTitle, messageHash);
     }
 
     private String buildAlertTitle(JsonObject event, JsonObject message, String sourceLabel) {
@@ -401,29 +409,26 @@ public class ZulipPollingThread extends Thread {
         }
         message.append(Text.literal(sender).setStyle(senderStyle))
                 .append(Text.literal(": ").setStyle(Style.EMPTY.withColor(messageColor)))
-                .append(buildClickableContentText(content, messageColor));
+                .append(buildIncomingContentText(content, messageColor));
 
         MinecraftClient client = MinecraftClient.getInstance();
         // Must be dispatched on the render thread to avoid threading issues.
         client.execute(() -> {
             if (client.inGameHud != null) {
-                ChatImageRegistry.bindDisplayText(messageHash, message);
                 client.inGameHud.getChatHud().addMessage(message);
             }
             if (alertTitle != null) {
-                notifyIncomingMessage(client, alertTitle, sender, content);
+                notifyIncomingMessage(client, alertTitle, sender, buildNotificationPreview(content));
             }
         });
     }
 
-    private String formatIncomingContent(String content) {
+    private Text buildIncomingContentText(String content, int color) {
+        String normalizedContent = EmojiShortcodes.replace(content);
         return switch (config.incomingMessageFormat()) {
-            case RAW_MARKDOWN -> content.replace("\n", " | ");
-            case PLAIN_TEXT -> content
-                    .replaceAll("\\*\\*(.*?)\\*\\*", "$1")
-                    .replaceAll("\\*(.*?)\\*", "$1")
-                    .replaceAll("`(.*?)`", "$1")
-                    .replace("\n", " | ");
+            case RAW_MARKDOWN -> buildRawContentText(normalizedContent, color);
+            case PLAIN_TEXT -> buildRawContentText(stripMarkdownFormatting(normalizedContent), color);
+            case MARKDOWN -> buildMarkdownContentText(normalizedContent, color);
         };
     }
 
@@ -432,18 +437,13 @@ public class ZulipPollingThread extends Thread {
         return prefix.endsWith(" ") ? prefix : prefix + " ";
     }
 
-    // Build a Text component with clickable URL segments
-    private Text buildClickableContentText(String content, int color) {
+    private Text buildRawContentText(String content, int color) {
+        String safeContent = content == null ? "" : content;
         int index = 0;
         net.minecraft.text.MutableText result = Text.empty();
-        while (index < content.length()) {
-            int markerStart = content.indexOf(IMAGE_MARKER_PREFIX, index);
-            Matcher markdownImageMatcher = MARKDOWN_LINK_PATTERN.matcher(content);
-            boolean foundMarkdownImage = markdownImageMatcher.find(index);
-            int markdownImageStart = foundMarkdownImage && looksLikeImageReference(markdownImageMatcher.group(1), markdownImageMatcher.group(2))
-                    ? markdownImageMatcher.start()
-                    : -1;
-            Matcher urlMatcher = URL_PATTERN.matcher(content);
+        while (index < safeContent.length()) {
+            int markerStart = safeContent.indexOf(IMAGE_MARKER_PREFIX, index);
+            Matcher urlMatcher = URL_PATTERN.matcher(safeContent);
             boolean foundUrl = urlMatcher.find(index);
             int urlStart = foundUrl ? urlMatcher.start() : -1;
 
@@ -453,82 +453,206 @@ public class ZulipPollingThread extends Thread {
                 nextStart = markerStart;
                 tokenType = "marker";
             }
-            if (markdownImageStart >= 0 && (nextStart < 0 || markdownImageStart < nextStart)) {
-                nextStart = markdownImageStart;
-                tokenType = "markdownImage";
-            }
             if (urlStart >= 0 && (nextStart < 0 || urlStart < nextStart)) {
                 nextStart = urlStart;
                 tokenType = "url";
             }
 
             if (nextStart < 0) {
-                result.append(Text.literal(content.substring(index)).setStyle(Style.EMPTY.withColor(color)));
+                appendStyledLiteral(result, safeContent.substring(index), Style.EMPTY.withColor(color));
                 break;
             }
 
             if (nextStart > index) {
-                result.append(Text.literal(content.substring(index, nextStart)).setStyle(Style.EMPTY.withColor(color)));
+                appendStyledLiteral(result, safeContent.substring(index, nextStart), Style.EMPTY.withColor(color));
             }
 
             if ("marker".equals(tokenType)) {
-                int markerEnd = content.indexOf(IMAGE_MARKER_SUFFIX, markerStart + IMAGE_MARKER_PREFIX.length());
+                int markerEnd = safeContent.indexOf(IMAGE_MARKER_SUFFIX, markerStart + IMAGE_MARKER_PREFIX.length());
                 if (markerEnd < 0) {
-                    result.append(Text.literal(content.substring(markerStart)).setStyle(Style.EMPTY.withColor(color)));
+                    appendStyledLiteral(result, safeContent.substring(markerStart), Style.EMPTY.withColor(color));
                     break;
                 }
 
-                String imageHash = content.substring(markerStart + IMAGE_MARKER_PREFIX.length(), markerEnd);
+                String imageHash = safeContent.substring(markerStart + IMAGE_MARKER_PREFIX.length(), markerEnd);
                 appendImagePreviewToken(result, imageHash);
                 index = markerEnd + IMAGE_MARKER_SUFFIX.length();
                 continue;
             }
 
-            if ("markdownImage".equals(tokenType)) {
-                String resolvedUrl = resolveMarkdownImageUrl(markdownImageMatcher.group(1), markdownImageMatcher.group(2));
-                if (resolvedUrl != null) {
-                    appendImagePreviewToken(result, resolveImageHash(resolvedUrl));
-                    index = markdownImageMatcher.end();
-                    continue;
-                }
-            }
-
             String url = urlMatcher.group(1);
-            result.append(Text.literal(url).setStyle(Style.EMPTY.withColor(0x3366FF).withUnderline(true)
-                    .withClickEvent(new ClickEvent.OpenUrl(URI.create(url)))
-                    .withHoverEvent(new HoverEvent.ShowText(Text.literal("Open \"" + url + "\"")))));
+            appendUrl(result, url, Style.EMPTY.withColor(color));
             index = urlMatcher.end();
         }
 
         return result;
     }
 
+    private Text buildMarkdownContentText(String content, int color) {
+        String safeContent = content == null ? "" : content;
+        String[] lines = safeContent.split("\\R", -1);
+        net.minecraft.text.MutableText result = Text.empty();
+        boolean inCodeBlock = false;
+
+        for (int i = 0; i < lines.length; i++) {
+            if (i > 0) {
+                result.append(Text.literal("\n").setStyle(Style.EMPTY.withColor(color)));
+            }
+
+            String line = lines[i];
+            if (line.startsWith("```")) {
+                inCodeBlock = !inCodeBlock;
+                continue;
+            }
+
+            net.minecraft.text.MutableText lineText = Text.empty();
+            if (inCodeBlock) {
+                appendStyledLiteral(lineText, line, Style.EMPTY.withColor(0xD7BA7D));
+                result.append(lineText);
+                continue;
+            }
+
+            Matcher headingMatcher = MARKDOWN_HEADING_PATTERN.matcher(line);
+            if (headingMatcher.matches()) {
+                int level = headingMatcher.group(1).length();
+                appendMarkdownInlineText(lineText, headingMatcher.group(2), headingStyle(level, color));
+                result.append(lineText);
+                continue;
+            }
+
+            Matcher quoteMatcher = MARKDOWN_QUOTE_PATTERN.matcher(line);
+            if (quoteMatcher.matches()) {
+                appendStyledLiteral(lineText, "| ", Style.EMPTY.withColor(0x7F8EA8));
+                appendMarkdownInlineText(lineText, quoteMatcher.group(1), Style.EMPTY.withColor(0xC8D4E3).withItalic(true));
+                result.append(lineText);
+                continue;
+            }
+
+            Matcher listMatcher = MARKDOWN_LIST_PATTERN.matcher(line);
+            if (listMatcher.matches()) {
+                String marker = listMatcher.group(2).trim();
+                String prefix = Character.isDigit(marker.charAt(0)) ? marker + " " : "• ";
+                appendStyledLiteral(lineText, prefix, Style.EMPTY.withColor(0x9FB3D9));
+                appendMarkdownInlineText(lineText, listMatcher.group(3), Style.EMPTY.withColor(color));
+                result.append(lineText);
+                continue;
+            }
+
+            appendMarkdownInlineText(lineText, line, Style.EMPTY.withColor(color));
+            result.append(lineText);
+        }
+
+        return result;
+    }
+
+    private void appendMarkdownInlineText(net.minecraft.text.MutableText result, String content, Style baseStyle) {
+        if (content == null || content.isEmpty()) return;
+
+        Matcher matcher = MARKDOWN_INLINE_TOKEN_PATTERN.matcher(content);
+        int index = 0;
+        while (matcher.find()) {
+            if (matcher.start() > index) {
+                appendStyledLiteral(result, content.substring(index, matcher.start()), baseStyle);
+            }
+
+            if (matcher.group(1) != null) {
+                appendImagePreviewToken(result, matcher.group(1));
+            } else if (matcher.group(2) != null) {
+                appendMarkdownLink(result, matcher.group(2), matcher.group(3), baseStyle);
+            } else if (matcher.group(4) != null) {
+                appendStyledLiteral(result, matcher.group(4), baseStyle.withColor(0xD7BA7D));
+            } else if (matcher.group(5) != null) {
+                appendMarkdownInlineText(result, matcher.group(5), baseStyle.withBold(true));
+            } else if (matcher.group(6) != null) {
+                appendMarkdownInlineText(result, matcher.group(6), baseStyle.withStrikethrough(true));
+            } else if (matcher.group(7) != null) {
+                appendMarkdownInlineText(result, matcher.group(7), baseStyle.withItalic(true));
+            } else if (matcher.group(8) != null) {
+                appendUrl(result, matcher.group(8), baseStyle);
+            }
+
+            index = matcher.end();
+        }
+
+        if (index < content.length()) {
+            appendStyledLiteral(result, content.substring(index), baseStyle);
+        }
+    }
+
+    private void appendMarkdownLink(net.minecraft.text.MutableText result, String label, String rawUrl, Style baseStyle) {
+        String resolvedUrl = resolveMarkdownLinkUrl(rawUrl);
+        if (resolvedUrl == null || resolvedUrl.isBlank()) {
+            appendStyledLiteral(result, label, baseStyle);
+            return;
+        }
+
+        try {
+            result.append(Text.literal(label).setStyle(baseStyle.withColor(0x77B7FF).withUnderline(true)
+                    .withClickEvent(new ClickEvent.OpenUrl(URI.create(resolvedUrl)))
+                    .withHoverEvent(new HoverEvent.ShowText(Text.literal("Open \"" + resolvedUrl + "\"")))));
+        } catch (IllegalArgumentException exception) {
+            appendStyledLiteral(result, label, baseStyle);
+        }
+    }
+
+    private void appendUrl(net.minecraft.text.MutableText result, String url, Style baseStyle) {
+        try {
+            result.append(Text.literal(url).setStyle(baseStyle.withColor(0x77B7FF).withUnderline(true)
+                    .withClickEvent(new ClickEvent.OpenUrl(URI.create(url)))
+                    .withHoverEvent(new HoverEvent.ShowText(Text.literal("Open \"" + url + "\"")))));
+        } catch (IllegalArgumentException exception) {
+            appendStyledLiteral(result, url, baseStyle);
+        }
+    }
+
+    private static void appendStyledLiteral(net.minecraft.text.MutableText result, String value, Style style) {
+        if (value == null || value.isEmpty()) return;
+        result.append(Text.literal(value).setStyle(style));
+    }
+
+    private static Style headingStyle(int level, int fallbackColor) {
+        int color = switch (level) {
+            case 1 -> 0x9CDCFE;
+            case 2 -> 0xB5CEA8;
+            case 3 -> 0xDCDCAA;
+            case 4 -> 0xC586C0;
+            default -> fallbackColor;
+        };
+        return Style.EMPTY.withColor(color).withBold(true);
+    }
+
+    private String buildNotificationPreview(String content) {
+        String preview = EmojiShortcodes.replace(stripMarkdownFormatting(content)).replace('\n', ' ').replace('\r', ' ').trim();
+        preview = preview.replaceAll("\\s+", " ");
+        return preview.length() > 100 ? preview.substring(0, 97) + "..." : preview;
+    }
+
+    private static String stripMarkdownFormatting(String content) {
+        if (content == null || content.isEmpty()) return "";
+
+        String plain = IMAGE_MARKER_PATTERN.matcher(content).replaceAll(" [image]");
+        plain = MARKDOWN_LINK_PATTERN.matcher(plain).replaceAll("$1");
+        plain = plain.replaceAll("(?m)^#{1,6}\\s+", "");
+        plain = plain.replaceAll("(?m)^>\\s?", "");
+        plain = plain.replaceAll("(?m)^\\s*([-*+]\\s+|\\d+\\.\\s+)", "");
+        plain = plain.replace("```", "");
+        plain = plain.replaceAll("\\*\\*(.*?)\\*\\*", "$1");
+        plain = plain.replaceAll("~~(.*?)~~", "$1");
+        plain = plain.replaceAll("\\*(.*?)\\*", "$1");
+        plain = plain.replaceAll("`(.*?)`", "$1");
+        return plain;
+    }
+
     private static void appendImagePreviewToken(net.minecraft.text.MutableText result, String imageHash) {
-        result.append(Text.literal(" "));
-        result.append(Text.literal("img").setStyle(Style.EMPTY.withColor(0x3366FF).withUnderline(true)
+        result.append(Text.literal("[image]").setStyle(Style.EMPTY.withColor(0x77B7FF).withUnderline(true)
                 .withClickEvent(new ClickEvent.RunCommand("/zulip preview " + imageHash))
                 .withHoverEvent(new HoverEvent.ShowText(Text.literal("Click to preview")))));
     }
 
-    private String processImagesInContent(String formattedContent, String rawHtml, JsonObject message, String messageHash) {
-        LinkedHashSet<String> imageUrls = collectImageUrls(rawHtml, message);
-        Matcher matcher = INLINE_IMAGE_PATTERN.matcher(formattedContent);
-        StringBuilder sb = new StringBuilder();
-        int last = 0;
+    private String processImagesInContent(String content, JsonObject message, String messageHash) {
+        LinkedHashSet<String> imageUrls = collectImageUrls(content, message);
         LinkedHashSet<String> inlineUrls = new LinkedHashSet<>();
-
-        while (matcher.find()) {
-            String resolvedUrl = resolveImageUrl(matcher.group(1));
-            inlineUrls.add(resolvedUrl);
-            sb.append(formattedContent, last, matcher.start());
-            sb.append(imageMarker(resolveImageHash(resolvedUrl)));
-            scheduleImageLoad(messageHash, resolvedUrl);
-            last = matcher.end();
-        }
-
-        sb.append(formattedContent.substring(last));
-        String contentWithInlineImages = sb.toString();
-        String contentWithMarkdownImages = replaceMarkdownImageLinks(contentWithInlineImages, messageHash, inlineUrls);
+        String contentWithMarkdownImages = replaceMarkdownImageLinks(content, messageHash, inlineUrls);
 
         for (String imageUrl : imageUrls) {
             if (inlineUrls.contains(imageUrl)) continue;
@@ -539,15 +663,10 @@ public class ZulipPollingThread extends Thread {
         return contentWithMarkdownImages;
     }
 
-    private LinkedHashSet<String> collectImageUrls(String rawHtml, JsonObject message) {
+    private LinkedHashSet<String> collectImageUrls(String content, JsonObject message) {
         LinkedHashSet<String> imageUrls = new LinkedHashSet<>();
 
-        Matcher matcher = INLINE_IMAGE_PATTERN.matcher(rawHtml == null ? "" : rawHtml);
-        while (matcher.find()) {
-            imageUrls.add(resolveImageUrl(matcher.group(1)));
-        }
-
-        Matcher markdownMatcher = MARKDOWN_LINK_PATTERN.matcher(rawHtml == null ? "" : rawHtml);
+        Matcher markdownMatcher = MARKDOWN_LINK_PATTERN.matcher(content == null ? "" : content);
         while (markdownMatcher.find()) {
             String resolvedUrl = resolveMarkdownImageUrl(markdownMatcher.group(1), markdownMatcher.group(2));
             if (resolvedUrl != null) imageUrls.add(resolvedUrl);
@@ -600,11 +719,6 @@ public class ZulipPollingThread extends Thread {
                             MinecraftClient.getInstance().execute(() -> {
                                 ImageCache.CachedImage image = ImageCache.getOrLoad(imageHash, bytes, imageUrl, gif);
                                 if (image == null) return;
-
-                                ChatImageRegistry.addThumbnail(
-                                        messageHash,
-                                        new ChatImageThumbnail(imageHash)
-                                );
                             });
                         })
                         .exceptionally(throwable -> {
@@ -766,6 +880,12 @@ public class ZulipPollingThread extends Thread {
     private String resolveMarkdownImageUrl(String label, String url) {
         String normalizedUrl = normalizeMarkdownLinkUrl(url);
         if (!looksLikeImageReference(label, normalizedUrl)) return null;
+        return resolveImageUrl(normalizedUrl);
+    }
+
+    private String resolveMarkdownLinkUrl(String url) {
+        String normalizedUrl = normalizeMarkdownLinkUrl(url);
+        if (normalizedUrl.isBlank()) return "";
         return resolveImageUrl(normalizedUrl);
     }
 

@@ -1,6 +1,7 @@
 package dev.remgr.zulipbridge;
 
 import dev.remgr.zulipbridge.config.ZulipBridgeConfig;
+import dev.remgr.zulipbridge.image.ImageCache;
 import io.wispforest.owo.config.Option;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -10,8 +11,6 @@ import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
 import net.minecraft.util.Identifier;
-import dev.remgr.zulipbridge.image.ImageCache;
-import dev.remgr.zulipbridge.chat.ChatImageRegistry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.lwjgl.glfw.GLFW;
@@ -29,6 +28,8 @@ public class ZulipBridgeClient implements ClientModInitializer {
 
     private static ZulipPollingThread pollingThread;
     private static KeyBinding openGuiKeybind;
+    private static boolean previewLeftMouseDown;
+    private static boolean previewEscapeDown;
 
     @Override
     public void onInitializeClient() {
@@ -45,7 +46,6 @@ public class ZulipBridgeClient implements ClientModInitializer {
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
             stopBridge();
             ImageCache.clear();
-            ChatImageRegistry.clear();
         });
 
         // Register preview HUD overlay
@@ -149,7 +149,29 @@ public class ZulipBridgeClient implements ClientModInitializer {
             while (openGuiKeybind.wasPressed()) {
                 openBridgeScreen(client);
             }
+
+            handlePreviewControls(client);
         });
+    }
+
+    private static void handlePreviewControls(MinecraftClient client) {
+        if (client == null || client.getWindow() == null) return;
+
+        long windowHandle = client.getWindow().getHandle();
+
+        boolean escapeDown = GLFW.glfwGetKey(windowHandle, GLFW.GLFW_KEY_ESCAPE) == GLFW.GLFW_PRESS;
+        if (escapeDown && !previewEscapeDown) {
+            dev.remgr.zulipbridge.image.PreviewHud.handleEscape(GLFW.GLFW_KEY_ESCAPE);
+        }
+        previewEscapeDown = escapeDown;
+
+        boolean leftMouseDown = GLFW.glfwGetMouseButton(windowHandle, GLFW.GLFW_MOUSE_BUTTON_LEFT) == GLFW.GLFW_PRESS;
+        if (leftMouseDown && !previewLeftMouseDown) {
+            double mouseX = client.mouse.getX() * client.getWindow().getScaledWidth() / client.getWindow().getWidth();
+            double mouseY = client.mouse.getY() * client.getWindow().getScaledHeight() / client.getWindow().getHeight();
+            dev.remgr.zulipbridge.image.PreviewHud.handleClick(mouseX, mouseY);
+        }
+        previewLeftMouseDown = leftMouseDown;
     }
 
     private static void onConfigChanged() {

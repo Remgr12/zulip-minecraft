@@ -11,6 +11,7 @@ import javax.imageio.metadata.IIOMetadata;
 import javax.imageio.stream.ImageInputStream;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -95,17 +96,14 @@ public final class AnimatedTexture extends NativeImageBackedTexture {
     }
 
     private static NativeImage toNativeImage(BufferedImage image) {
-        NativeImage nativeImage = new NativeImage(image.getWidth(), image.getHeight(), true);
-        for (int y = 0; y < image.getHeight(); y++) {
-            for (int x = 0; x < image.getWidth(); x++) {
-                int argb = image.getRGB(x, y);
-                int abgr = (argb & 0xFF00FF00)
-                        | ((argb >> 16) & 0x000000FF)
-                        | ((argb << 16) & 0x00FF0000);
-                nativeImage.setColorArgb(x, y, abgr);
+        try (ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            if (!ImageIO.write(image, "png", output)) {
+                throw new IOException("PNG writer is unavailable");
             }
+            return NativeImage.read(new ByteArrayInputStream(output.toByteArray()));
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to convert GIF frame", e);
         }
-        return nativeImage;
     }
 
     private static NativeImage cloneImage(NativeImage source) {

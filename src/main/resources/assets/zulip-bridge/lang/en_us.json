@@ -48,7 +48,7 @@
   "text.config.zulip-bridge.option.incomingPrefix.tooltip": "Text prepended to Zulip messages shown in Minecraft chat.",
 
   "text.config.zulip-bridge.option.showIncomingPrefix":     "Show Incoming Prefix",
-  "text.config.zulip-bridge.option.showIncomingPrefix.tooltip": "Show or hide the Zulip prefix/badge on incoming messages.\nOnly the sender color will be shown when disabled.",
+  "text.config.zulip-bridge.option.showIncomingPrefix.tooltip": "Show or hide the Zulip text prefix on incoming messages.\nOnly the sender color will be shown when disabled.",
 
   "text.config.zulip-bridge.option.senderColor":            "Sender Color",
   "text.config.zulip-bridge.option.senderColor.tooltip":    "Hex color for incoming sender names.\nUse #RRGGBB, for example #67FF67.",
