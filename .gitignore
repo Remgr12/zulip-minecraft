@@ -13,3 +13,4 @@ out/
 .DS_Store
 run/
 CLAUDE.md
+.last_build_tree
