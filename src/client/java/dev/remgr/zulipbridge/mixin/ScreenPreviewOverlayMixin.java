@@ -14,10 +14,9 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 public class ScreenPreviewOverlayMixin {
 
     @Inject(method = "keyPressed(Lnet/minecraft/client/input/KeyInput;)Z", at = @At("HEAD"), cancellable = true)
-    private void zulipBridge$closePreviewOnEscape(KeyInput keyInput, CallbackInfoReturnable<Boolean> cir) {
-        if (PreviewHud.handleEscape(keyInput.key())) {
-            cir.setReturnValue(true);
-        }
+    private void zulipBridge$blockKeysWhilePreviewOpen(KeyInput keyInput, CallbackInfoReturnable<Boolean> cir) {
+        if (!PreviewHud.isActive()) return;
+        cir.setReturnValue(true);
     }
 
     @Inject(method = "render(Lnet/minecraft/client/gui/DrawContext;IIF)V", at = @At("TAIL"))

@@ -2,6 +2,7 @@ package dev.remgr.zulipbridge;
 
 import dev.remgr.zulipbridge.config.ZulipBridgeConfig;
 import dev.remgr.zulipbridge.image.ImageCache;
+import dev.remgr.zulipbridge.text.CustomEmojiRegistry;
 import io.wispforest.owo.config.Option;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
@@ -46,6 +47,7 @@ public class ZulipBridgeClient implements ClientModInitializer {
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
             stopBridge();
             ImageCache.clear();
+            CustomEmojiRegistry.clear();
         });
 
         // Register preview HUD overlay
@@ -59,6 +61,7 @@ public class ZulipBridgeClient implements ClientModInitializer {
         stopBridge();
         LOGGER.info("Starting Zulip bridge ({}#{}).",
                 CONFIG.streamName(), CONFIG.topicName());
+        CustomEmojiRegistry.refreshAsync(CONFIG);
         pollingThread = new ZulipPollingThread(CONFIG);
         pollingThread.start();
     }
@@ -102,6 +105,7 @@ public class ZulipBridgeClient implements ClientModInitializer {
 
     public static void openBridgeScreen(MinecraftClient client) {
         if (client == null) return;
+        CustomEmojiRegistry.refreshAsync(CONFIG);
         client.execute(() -> {
             if (!(client.currentScreen instanceof ZulipBridgeScreen)) {
                 client.setScreen(new ZulipBridgeScreen());
@@ -169,7 +173,9 @@ public class ZulipBridgeClient implements ClientModInitializer {
         if (leftMouseDown && !previewLeftMouseDown) {
             double mouseX = client.mouse.getX() * client.getWindow().getScaledWidth() / client.getWindow().getWidth();
             double mouseY = client.mouse.getY() * client.getWindow().getScaledHeight() / client.getWindow().getHeight();
-            dev.remgr.zulipbridge.image.PreviewHud.handleClick(mouseX, mouseY);
+            dev.remgr.zulipbridge.image.PreviewHud.handleMousePressed(mouseX, mouseY);
+        } else if (!leftMouseDown && previewLeftMouseDown) {
+            dev.remgr.zulipbridge.image.PreviewHud.handleMouseReleased();
         }
         previewLeftMouseDown = leftMouseDown;
     }

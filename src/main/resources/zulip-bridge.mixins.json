@@ -4,7 +4,9 @@
   "refmap": "client-zulip-bridge.refmap.json",
   "compatibilityLevel": "JAVA_21",
   "client": [
+    "ChatInlineEmojiRendererMixin",
     "ChatScreenMixin",
+    "MousePreviewScrollMixin",
     "ScreenPreviewOverlayMixin"
   ],
   "injectors": {

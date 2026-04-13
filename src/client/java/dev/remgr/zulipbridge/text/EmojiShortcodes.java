@@ -10,6 +10,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -28,7 +29,7 @@ public final class EmojiShortcodes {
         Matcher matcher = SHORTCODE_PATTERN.matcher(content);
         StringBuilder result = new StringBuilder();
         while (matcher.find()) {
-            String replacement = EMOJIS.get(matcher.group(1).toLowerCase());
+            String replacement = resolve(matcher.group(1).toLowerCase());
             matcher.appendReplacement(result, Matcher.quoteReplacement(replacement == null ? matcher.group(0) : replacement));
         }
         matcher.appendTail(result);
@@ -37,20 +38,55 @@ public final class EmojiShortcodes {
 
     public static String get(String shortcode) {
         if (shortcode == null || shortcode.isBlank()) return null;
-        return EMOJIS.get(shortcode.toLowerCase());
+        return resolve(shortcode.toLowerCase());
+    }
+
+    /** Resolves a shortcode to its emoji string, including flag_XX country codes. */
+    private static String resolve(String shortcode) {
+        String emoji = EMOJIS.get(shortcode);
+        if (emoji != null) return emoji;
+        // :flag_XX: → regional indicator pair (e.g. :flag_us: → 🇺🇸)
+        if (shortcode.startsWith("flag_") && shortcode.length() == 7) {
+            return flagEmoji(shortcode.substring(5));
+        }
+        return null;
+    }
+
+    /**
+     * Converts a two-letter ISO 3166-1 alpha-2 country code to its flag emoji.
+     * Returns null if the code is not exactly two lowercase ASCII letters.
+     */
+    private static String flagEmoji(String code) {
+        if (code.length() != 2) return null;
+        char a = code.charAt(0), b = code.charAt(1);
+        if (a < 'a' || a > 'z' || b < 'a' || b > 'z') return null;
+        // Regional Indicator Symbol Letters: U+1F1E6 (A) … U+1F1FF (Z)
+        return new String(new int[]{0x1F1E6 + (a - 'a'), 0x1F1E6 + (b - 'a')}, 0, 2);
+    }
+
+    public static CustomEmojiRegistry.CustomEmoji getCustom(String shortcode) {
+        return CustomEmojiRegistry.get(shortcode);
     }
 
     public static List<String> suggest(String query, int limit) {
-        if (limit <= 0 || SHORTCODE_NAMES.isEmpty()) return List.of();
+        if (limit <= 0) return List.of();
 
         String normalizedQuery = query == null ? "" : query.trim().toLowerCase();
+        Set<String> customNames = CustomEmojiRegistry.names();
+        List<String> allNames = new ArrayList<>(SHORTCODE_NAMES.size() + customNames.size());
+        allNames.addAll(SHORTCODE_NAMES);
+        allNames.addAll(customNames);
+        allNames.sort(Comparator.naturalOrder());
+
+        if (allNames.isEmpty()) return List.of();
+
         List<String> startsWith = new ArrayList<>(limit);
         List<String> contains = new ArrayList<>(limit);
-        for (String shortcode : SHORTCODE_NAMES) {
+        for (String shortcode : allNames) {
             if (normalizedQuery.isEmpty() || shortcode.startsWith(normalizedQuery)) {
-                startsWith.add(shortcode);
+                if (!startsWith.contains(shortcode)) startsWith.add(shortcode);
             } else if (shortcode.contains(normalizedQuery)) {
-                contains.add(shortcode);
+                if (!contains.contains(shortcode)) contains.add(shortcode);
             }
 
             if (startsWith.size() >= limit) {
@@ -65,6 +101,19 @@ public final class EmojiShortcodes {
             results.add(shortcode);
         }
         return List.copyOf(results);
+    }
+
+    public static String replaceCustomWithLabels(String content) {
+        if (content == null || content.isEmpty()) return "";
+
+        Matcher matcher = SHORTCODE_PATTERN.matcher(content);
+        StringBuilder result = new StringBuilder();
+        while (matcher.find()) {
+            CustomEmojiRegistry.CustomEmoji customEmoji = getCustom(matcher.group(1));
+            matcher.appendReplacement(result, Matcher.quoteReplacement(customEmoji == null ? matcher.group(0) : "[" + customEmoji.name() + "]"));
+        }
+        matcher.appendTail(result);
+        return result.toString();
     }
 
     private static Map<String, String> loadEmojiMap() {

@@ -4,8 +4,11 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import dev.remgr.zulipbridge.config.ZulipBridgeConfig;
+import dev.remgr.zulipbridge.chat.ChatImageRegistry;
 import dev.remgr.zulipbridge.image.ImageCache;
+import dev.remgr.zulipbridge.text.CustomEmojiRegistry;
 import dev.remgr.zulipbridge.text.EmojiShortcodes;
+import dev.remgr.zulipbridge.text.InlineEmoji;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.sound.PositionedSoundInstance;
 import net.minecraft.client.toast.SystemToast;
@@ -34,6 +37,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -59,6 +63,9 @@ public class ZulipPollingThread extends Thread {
     private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(10);
     private static final Duration EVENT_REQUEST_TIMEOUT = Duration.ofSeconds(120);
     private static final Set<Long> CHAT_DM_SELF_ECHO_MESSAGE_IDS = new HashSet<>();
+    /** Maps IDs of messages sent by the configured account to their source label (e.g. "general > minecraft"). */
+    private static final int OWN_MESSAGE_IDS_MAX = 500;
+    private static final Map<Long, String> OWN_MESSAGE_SOURCES = Collections.synchronizedMap(new java.util.LinkedHashMap<>());
     private static final String IMAGE_MARKER_PREFIX = "[[ZULIP_IMG:";
     private static final String IMAGE_MARKER_SUFFIX = "]]";
     private static final Pattern IMAGE_MARKER_PATTERN = Pattern.compile(Pattern.quote(IMAGE_MARKER_PREFIX) + "([^\\]]+)" + Pattern.quote(IMAGE_MARKER_SUFFIX));
@@ -66,6 +73,7 @@ public class ZulipPollingThread extends Thread {
     private static final Pattern MARKDOWN_HEADING_PATTERN = Pattern.compile("^(#{1,6})\\s+(.*)$");
     private static final Pattern MARKDOWN_QUOTE_PATTERN = Pattern.compile("^>\\s?(.*)$");
     private static final Pattern MARKDOWN_LIST_PATTERN = Pattern.compile("^(\\s*)([-*+]\\s+|\\d+\\.\\s+)(.*)$");
+    private static final Pattern SHORTCODE_PATTERN = Pattern.compile(":([a-z0-9_+\\-]+):", Pattern.CASE_INSENSITIVE);
     private static final Pattern MARKDOWN_INLINE_TOKEN_PATTERN = Pattern.compile(
             Pattern.quote(IMAGE_MARKER_PREFIX) + "([^\\]]+)" + Pattern.quote(IMAGE_MARKER_SUFFIX)
                     + "|\\[([^\\]]+)]\\(((?:[^()]|\\([^)]*\\))+?)\\)"
@@ -73,6 +81,7 @@ public class ZulipPollingThread extends Thread {
                     + "|\\*\\*([^*]+)\\*\\*"
                     + "|~~([^~]+)~~"
                     + "|\\*([^*]+)\\*"
+                    + "|:([a-z0-9_+\\-]+):"
                     + "|((https?|ftp)://\\S+)"
     );
     private static final Pattern URL_PATTERN = Pattern.compile("((https?|ftp)://\\S+)");
@@ -148,7 +157,7 @@ public class ZulipPollingThread extends Thread {
     // ── Event queue polling ───────────────────────────────────────────────────
 
     private EventQueueState registerEventQueue(HttpClient http) throws Exception {
-        String form = "event_types=" + URLEncoder.encode("[\"message\"]", StandardCharsets.UTF_8)
+        String form = "event_types=" + URLEncoder.encode("[\"message\",\"reaction\"]", StandardCharsets.UTF_8)
                 + "&narrow=" + URLEncoder.encode("[]", StandardCharsets.UTF_8)
                 + "&apply_markdown=false"
                 + "&client_gravatar=false";
@@ -223,7 +232,15 @@ public class ZulipPollingThread extends Thread {
                 lastEventId = Math.max(lastEventId, event.get("id").getAsLong());
             }
 
-            if (!event.has("type") || !"message".equals(event.get("type").getAsString())) continue;
+            if (!event.has("type")) continue;
+            String eventType = event.get("type").getAsString();
+
+            if ("reaction".equals(eventType)) {
+                handleReactionEvent(event);
+                continue;
+            }
+
+            if (!"message".equals(eventType)) continue;
             if (!event.has("message") || !event.get("message").isJsonObject()) continue;
 
             handleIncomingMessage(event, event.getAsJsonObject("message"));
@@ -237,6 +254,20 @@ public class ZulipPollingThread extends Thread {
         String sender = message.has("sender_full_name") ? message.get("sender_full_name").getAsString() : "Zulip";
         String senderEmail = message.has("sender_email") ? message.get("sender_email").getAsString() : "";
         boolean selfMessage = isSelfMessage(senderEmail);
+
+        // Always track own message IDs so reaction events can reference them later.
+        if (selfMessage) {
+            long ownId = extractMessageId(message);
+            if (ownId > 0) {
+                synchronized (OWN_MESSAGE_SOURCES) {
+                    if (OWN_MESSAGE_SOURCES.size() >= OWN_MESSAGE_IDS_MAX) {
+                        OWN_MESSAGE_SOURCES.remove(OWN_MESSAGE_SOURCES.keySet().iterator().next());
+                    }
+                    OWN_MESSAGE_SOURCES.put(ownId, sourceLabel);
+                }
+            }
+        }
+
         if (selfMessage && !shouldDisplaySelfMessage(message)) return;
         if (!shouldDisplayIncomingMessage(message)) return;
 
@@ -245,6 +276,78 @@ public class ZulipPollingThread extends Thread {
         String messageHash = buildMessageHash(message, sender, rawContent);
         String contentWithImages = processImagesInContent(rawContent, message, messageHash);
         displayInChat(sourceLabel, sender, senderEmail, contentWithImages, alertTitle, messageHash);
+    }
+
+    private void handleReactionEvent(JsonObject event) {
+        String op = event.has("op") ? event.get("op").getAsString() : "";
+        long messageId = event.has("message_id") ? event.get("message_id").getAsLong() : -1;
+        if (messageId < 0) return;
+
+        String emojiName = event.has("emoji_name") ? event.get("emoji_name").getAsString() : "";
+
+        // Resolve emoji for display (used in the chat notification).
+        String emojiDisplay = EmojiShortcodes.get(emojiName);
+        if (emojiDisplay == null) emojiDisplay = ":" + emojiName + ":";
+
+        // Get the reactor's display name.
+        String reactorName = "Someone";
+        if (event.has("user") && event.get("user").isJsonObject()) {
+            JsonObject user = event.getAsJsonObject("user");
+            if (user.has("full_name") && !user.get("full_name").getAsString().isBlank()) {
+                reactorName = user.get("full_name").getAsString();
+            }
+        }
+
+        String ownMessageSource = OWN_MESSAGE_SOURCES.get(messageId);
+        boolean isOwnMessage = ownMessageSource != null;
+        boolean isAdd = "add".equals(op);
+
+        String prefix = normalizePrefix(config.incomingPrefix());
+        final String finalEmoji = emojiDisplay;
+        final String finalReactor = reactorName;
+        final String finalSource = ownMessageSource;
+        final String finalEmojiName = emojiName;
+
+        MinecraftClient client = MinecraftClient.getInstance();
+        client.execute(() -> {
+            // Forward to the GUI screen so its reaction counts update instantly.
+            if (client.currentScreen instanceof ZulipBridgeScreen screen) {
+                screen.onReactionEvent(messageId, finalEmojiName, op);
+            }
+
+            // Show a chat notification only when someone reacts to our own message.
+            if (isOwnMessage && isAdd && client.inGameHud != null) {
+                net.minecraft.text.MutableText notification = Text.empty();
+                if (config.showIncomingPrefix()) {
+                    notification.append(Text.literal(prefix).setStyle(Style.EMPTY.withColor(Formatting.AQUA)));
+                }
+                String location = (finalSource != null && !finalSource.isBlank())
+                        ? " to your message in " + finalSource
+                        : " to your message";
+                notification
+                        .append(Text.literal(finalReactor).setStyle(Style.EMPTY.withColor(Formatting.GREEN)))
+                        .append(Text.literal(" reacted " + finalEmoji + location)
+                                .setStyle(Style.EMPTY.withColor(Formatting.GRAY)));
+                client.inGameHud.getChatHud().addMessage(notification);
+            }
+        });
+    }
+
+    /**
+     * Registers a sent message ID and its source label so that incoming
+     * reaction events can be matched against it and displayed with context.
+     *
+     * @param messageId the Zulip message ID returned by the send API
+     * @param source    human-readable source, e.g. {@code "general > minecraft"} or {@code "DM"}
+     */
+    public static void addOwnMessageId(long messageId, String source) {
+        if (messageId <= 0) return;
+        synchronized (OWN_MESSAGE_SOURCES) {
+            if (OWN_MESSAGE_SOURCES.size() >= OWN_MESSAGE_IDS_MAX) {
+                OWN_MESSAGE_SOURCES.remove(OWN_MESSAGE_SOURCES.keySet().iterator().next());
+            }
+            OWN_MESSAGE_SOURCES.put(messageId, source == null ? "" : source);
+        }
     }
 
     private String buildAlertTitle(JsonObject event, JsonObject message, String sourceLabel) {
@@ -400,6 +503,7 @@ public class ZulipPollingThread extends Thread {
                             Text.literal("Sender: " + senderEmail + "\nClick to prepare a DM target command")));
         }
 
+        ChatImageRegistry.clearInlineEmojis(messageHash);
         var message = Text.empty().copy();
         if (showPrefix) {
             message.append(prefixText);
@@ -409,12 +513,13 @@ public class ZulipPollingThread extends Thread {
         }
         message.append(Text.literal(sender).setStyle(senderStyle))
                 .append(Text.literal(": ").setStyle(Style.EMPTY.withColor(messageColor)))
-                .append(buildIncomingContentText(content, messageColor));
+                .append(buildIncomingContentText(content, messageColor, messageHash));
 
         MinecraftClient client = MinecraftClient.getInstance();
         // Must be dispatched on the render thread to avoid threading issues.
         client.execute(() -> {
             if (client.inGameHud != null) {
+                ChatImageRegistry.bindDisplayText(messageHash, message);
                 client.inGameHud.getChatHud().addMessage(message);
             }
             if (alertTitle != null) {
@@ -423,12 +528,12 @@ public class ZulipPollingThread extends Thread {
         });
     }
 
-    private Text buildIncomingContentText(String content, int color) {
+    private Text buildIncomingContentText(String content, int color, String inlineEmojiMessageHash) {
         String normalizedContent = EmojiShortcodes.replace(content);
         return switch (config.incomingMessageFormat()) {
-            case RAW_MARKDOWN -> buildRawContentText(normalizedContent, color);
-            case PLAIN_TEXT -> buildRawContentText(stripMarkdownFormatting(normalizedContent), color);
-            case MARKDOWN -> buildMarkdownContentText(normalizedContent, color);
+            case RAW_MARKDOWN -> buildRawContentText(normalizedContent, color, inlineEmojiMessageHash);
+            case PLAIN_TEXT -> buildRawContentText(stripMarkdownFormatting(normalizedContent), color, inlineEmojiMessageHash);
+            case MARKDOWN -> buildMarkdownContentText(normalizedContent, color, inlineEmojiMessageHash);
         };
     }
 
@@ -437,12 +542,15 @@ public class ZulipPollingThread extends Thread {
         return prefix.endsWith(" ") ? prefix : prefix + " ";
     }
 
-    private Text buildRawContentText(String content, int color) {
+    private Text buildRawContentText(String content, int color, String inlineEmojiMessageHash) {
         String safeContent = content == null ? "" : content;
         int index = 0;
         net.minecraft.text.MutableText result = Text.empty();
         while (index < safeContent.length()) {
             int markerStart = safeContent.indexOf(IMAGE_MARKER_PREFIX, index);
+            Matcher shortcodeMatcher = SHORTCODE_PATTERN.matcher(safeContent);
+            boolean foundShortcode = shortcodeMatcher.find(index);
+            int shortcodeStart = foundShortcode ? shortcodeMatcher.start() : -1;
             Matcher urlMatcher = URL_PATTERN.matcher(safeContent);
             boolean foundUrl = urlMatcher.find(index);
             int urlStart = foundUrl ? urlMatcher.start() : -1;
@@ -452,6 +560,10 @@ public class ZulipPollingThread extends Thread {
             if (markerStart >= 0) {
                 nextStart = markerStart;
                 tokenType = "marker";
+            }
+            if (shortcodeStart >= 0 && (nextStart < 0 || shortcodeStart < nextStart)) {
+                nextStart = shortcodeStart;
+                tokenType = "shortcode";
             }
             if (urlStart >= 0 && (nextStart < 0 || urlStart < nextStart)) {
                 nextStart = urlStart;
@@ -480,6 +592,17 @@ public class ZulipPollingThread extends Thread {
                 continue;
             }
 
+            if ("shortcode".equals(tokenType)) {
+                if (appendCustomEmojiToken(result, shortcodeMatcher.group(1), Style.EMPTY.withColor(color), inlineEmojiMessageHash)) {
+                    index = shortcodeMatcher.end();
+                    continue;
+                }
+
+                appendStyledLiteral(result, ":" + shortcodeMatcher.group(1) + ":", Style.EMPTY.withColor(color));
+                index = shortcodeMatcher.end();
+                continue;
+            }
+
             String url = urlMatcher.group(1);
             appendUrl(result, url, Style.EMPTY.withColor(color));
             index = urlMatcher.end();
@@ -488,7 +611,7 @@ public class ZulipPollingThread extends Thread {
         return result;
     }
 
-    private Text buildMarkdownContentText(String content, int color) {
+    private Text buildMarkdownContentText(String content, int color, String inlineEmojiMessageHash) {
         String safeContent = content == null ? "" : content;
         String[] lines = safeContent.split("\\R", -1);
         net.minecraft.text.MutableText result = Text.empty();
@@ -515,7 +638,7 @@ public class ZulipPollingThread extends Thread {
             Matcher headingMatcher = MARKDOWN_HEADING_PATTERN.matcher(line);
             if (headingMatcher.matches()) {
                 int level = headingMatcher.group(1).length();
-                appendMarkdownInlineText(lineText, headingMatcher.group(2), headingStyle(level, color));
+                appendMarkdownInlineText(lineText, headingMatcher.group(2), headingStyle(level, color), inlineEmojiMessageHash);
                 result.append(lineText);
                 continue;
             }
@@ -523,7 +646,7 @@ public class ZulipPollingThread extends Thread {
             Matcher quoteMatcher = MARKDOWN_QUOTE_PATTERN.matcher(line);
             if (quoteMatcher.matches()) {
                 appendStyledLiteral(lineText, "| ", Style.EMPTY.withColor(0x7F8EA8));
-                appendMarkdownInlineText(lineText, quoteMatcher.group(1), Style.EMPTY.withColor(0xC8D4E3).withItalic(true));
+                appendMarkdownInlineText(lineText, quoteMatcher.group(1), Style.EMPTY.withColor(0xC8D4E3).withItalic(true), inlineEmojiMessageHash);
                 result.append(lineText);
                 continue;
             }
@@ -533,19 +656,19 @@ public class ZulipPollingThread extends Thread {
                 String marker = listMatcher.group(2).trim();
                 String prefix = Character.isDigit(marker.charAt(0)) ? marker + " " : "• ";
                 appendStyledLiteral(lineText, prefix, Style.EMPTY.withColor(0x9FB3D9));
-                appendMarkdownInlineText(lineText, listMatcher.group(3), Style.EMPTY.withColor(color));
+                appendMarkdownInlineText(lineText, listMatcher.group(3), Style.EMPTY.withColor(color), inlineEmojiMessageHash);
                 result.append(lineText);
                 continue;
             }
 
-            appendMarkdownInlineText(lineText, line, Style.EMPTY.withColor(color));
+            appendMarkdownInlineText(lineText, line, Style.EMPTY.withColor(color), inlineEmojiMessageHash);
             result.append(lineText);
         }
 
         return result;
     }
 
-    private void appendMarkdownInlineText(net.minecraft.text.MutableText result, String content, Style baseStyle) {
+    private void appendMarkdownInlineText(net.minecraft.text.MutableText result, String content, Style baseStyle, String inlineEmojiMessageHash) {
         if (content == null || content.isEmpty()) return;
 
         Matcher matcher = MARKDOWN_INLINE_TOKEN_PATTERN.matcher(content);
@@ -562,13 +685,17 @@ public class ZulipPollingThread extends Thread {
             } else if (matcher.group(4) != null) {
                 appendStyledLiteral(result, matcher.group(4), baseStyle.withColor(0xD7BA7D));
             } else if (matcher.group(5) != null) {
-                appendMarkdownInlineText(result, matcher.group(5), baseStyle.withBold(true));
+                appendMarkdownInlineText(result, matcher.group(5), baseStyle.withBold(true), inlineEmojiMessageHash);
             } else if (matcher.group(6) != null) {
-                appendMarkdownInlineText(result, matcher.group(6), baseStyle.withStrikethrough(true));
+                appendMarkdownInlineText(result, matcher.group(6), baseStyle.withStrikethrough(true), inlineEmojiMessageHash);
             } else if (matcher.group(7) != null) {
-                appendMarkdownInlineText(result, matcher.group(7), baseStyle.withItalic(true));
+                appendMarkdownInlineText(result, matcher.group(7), baseStyle.withItalic(true), inlineEmojiMessageHash);
             } else if (matcher.group(8) != null) {
-                appendUrl(result, matcher.group(8), baseStyle);
+                if (!appendCustomEmojiToken(result, matcher.group(8), baseStyle, inlineEmojiMessageHash)) {
+                    appendStyledLiteral(result, ":" + matcher.group(8) + ":", baseStyle);
+                }
+            } else if (matcher.group(9) != null) {
+                appendUrl(result, matcher.group(9), baseStyle);
             }
 
             index = matcher.end();
@@ -610,6 +737,17 @@ public class ZulipPollingThread extends Thread {
         result.append(Text.literal(value).setStyle(style));
     }
 
+    private boolean appendCustomEmojiToken(net.minecraft.text.MutableText result, String shortcode, Style baseStyle, String inlineEmojiMessageHash) {
+        CustomEmojiRegistry.CustomEmoji customEmoji = CustomEmojiRegistry.get(shortcode);
+        if (customEmoji == null) return false;
+
+        String imageHash = resolveImageHash(customEmoji.url());
+        ChatImageRegistry.addInlineEmoji(inlineEmojiMessageHash, imageHash);
+        result.append(Text.literal(InlineEmoji.PLACEHOLDER_TEXT).setStyle(baseStyle.withClickEvent(new ClickEvent.RunCommand("/zulip preview " + imageHash))
+                .withHoverEvent(new HoverEvent.ShowText(Text.literal("Preview custom emoji")))));
+        return true;
+    }
+
     private static Style headingStyle(int level, int fallbackColor) {
         int color = switch (level) {
             case 1 -> 0x9CDCFE;
@@ -622,7 +760,7 @@ public class ZulipPollingThread extends Thread {
     }
 
     private String buildNotificationPreview(String content) {
-        String preview = EmojiShortcodes.replace(stripMarkdownFormatting(content)).replace('\n', ' ').replace('\r', ' ').trim();
+        String preview = EmojiShortcodes.replaceCustomWithLabels(EmojiShortcodes.replace(stripMarkdownFormatting(content))).replace('\n', ' ').replace('\r', ' ').trim();
         preview = preview.replaceAll("\\s+", " ");
         return preview.length() > 100 ? preview.substring(0, 97) + "..." : preview;
     }
@@ -653,6 +791,14 @@ public class ZulipPollingThread extends Thread {
         LinkedHashSet<String> imageUrls = collectImageUrls(content, message);
         LinkedHashSet<String> inlineUrls = new LinkedHashSet<>();
         String contentWithMarkdownImages = replaceMarkdownImageLinks(content, messageHash, inlineUrls);
+
+        Matcher shortcodeMatcher = SHORTCODE_PATTERN.matcher(content == null ? "" : content);
+        while (shortcodeMatcher.find()) {
+            CustomEmojiRegistry.CustomEmoji customEmoji = CustomEmojiRegistry.get(shortcodeMatcher.group(1));
+            if (customEmoji != null) {
+                scheduleEmojiImageLoad(shortcodeMatcher.group(1).toLowerCase(), customEmoji.url());
+            }
+        }
 
         for (String imageUrl : imageUrls) {
             if (inlineUrls.contains(imageUrl)) continue;
@@ -691,6 +837,14 @@ public class ZulipPollingThread extends Thread {
     }
 
     private void scheduleImageLoad(String messageHash, String imageUrl) {
+        scheduleImageLoad(messageHash, imageUrl, false);
+    }
+
+    private void scheduleEmojiImageLoad(String shortcode, String imageUrl) {
+        scheduleImageLoad("emoji:" + shortcode, imageUrl, true);
+    }
+
+    private void scheduleImageLoad(String messageHash, String imageUrl, boolean withAuth) {
         String imageHash = resolveImageHash(imageUrl);
         Thread.ofVirtual().name("ZulipImageDownload-" + messageHash + '-' + imageHash).start(() -> {
             try {
@@ -698,12 +852,15 @@ public class ZulipPollingThread extends Thread {
                         .followRedirects(HttpClient.Redirect.NORMAL)
                         .connectTimeout(REQUEST_TIMEOUT)
                         .build();
-                String downloadUrl = resolveImageDownloadUrl(httpClient, imageUrl);
-                HttpRequest request = HttpRequest.newBuilder()
+                String downloadUrl = withAuth ? imageUrl : resolveImageDownloadUrl(httpClient, imageUrl);
+                HttpRequest.Builder requestBuilder = HttpRequest.newBuilder()
                         .uri(URI.create(downloadUrl))
                         .timeout(REQUEST_TIMEOUT)
-                        .GET()
-                        .build();
+                        .GET();
+                if (withAuth) {
+                    requestBuilder.header("Authorization", buildAuthHeader());
+                }
+                HttpRequest request = requestBuilder.build();
 
                 httpClient
                         .sendAsync(request, HttpResponse.BodyHandlers.ofByteArray())
@@ -1063,9 +1220,13 @@ public class ZulipPollingThread extends Thread {
                     return;
                 }
 
-                if (cfg.messageTarget() == dev.remgr.zulipbridge.config.ZulipBridgeConfigModel.MessageTarget.DIRECT_MESSAGE) {
-                    long sentMessageId = body.has("id") ? body.get("id").getAsLong() : -1;
-                    if (sentMessageId > 0) {
+                long sentMessageId = body.has("id") ? body.get("id").getAsLong() : -1;
+                if (sentMessageId > 0) {
+                    String source = cfg.messageTarget() == dev.remgr.zulipbridge.config.ZulipBridgeConfigModel.MessageTarget.DIRECT_MESSAGE
+                            ? "DM"
+                            : "#" + cfg.streamName() + " > " + cfg.topicName();
+                    addOwnMessageId(sentMessageId, source);
+                    if (cfg.messageTarget() == dev.remgr.zulipbridge.config.ZulipBridgeConfigModel.MessageTarget.DIRECT_MESSAGE) {
                         allowChatDmSelfEchoMessageId(sentMessageId);
                     }
                 }

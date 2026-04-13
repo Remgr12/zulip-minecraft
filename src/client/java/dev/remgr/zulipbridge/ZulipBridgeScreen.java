@@ -7,7 +7,9 @@ import dev.remgr.zulipbridge.config.ZulipBridgeConfig;
 import dev.remgr.zulipbridge.image.ImageCache;
 import dev.remgr.zulipbridge.image.ImageRenderer;
 import dev.remgr.zulipbridge.image.PreviewHud;
+import dev.remgr.zulipbridge.text.CustomEmojiRegistry;
 import dev.remgr.zulipbridge.text.EmojiShortcodes;
+import dev.remgr.zulipbridge.text.InlineEmoji;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.Click;
 import net.minecraft.client.gui.DrawContext;
@@ -64,6 +66,7 @@ public class ZulipBridgeScreen extends Screen {
     private static final int MAX_MENTION_SUGGESTIONS = 6;
     private static final int MENTION_SUGGESTION_ROW_HEIGHT = 14;
     private static final Pattern MARKDOWN_LINK_PATTERN = Pattern.compile("\\[([^\\]]+)]\\(((?:[^()]|\\([^)]*\\))+?)\\)");
+    private static final Pattern SHORTCODE_PATTERN = Pattern.compile(":([a-z0-9_+\\-]+):", Pattern.CASE_INSENSITIVE);
     private static final Pattern USER_UPLOAD_PATH_PATTERN = Pattern.compile("^/user_uploads/([^/]+)/(.*)$");
     private static final Set<String> PERSISTED_POLLED_CHANNELS = new HashSet<>();
     private static boolean PERSISTED_POLL_ALL_CONVERSATIONS = false;
@@ -96,6 +99,8 @@ public class ZulipBridgeScreen extends Screen {
     private String statusMessage = "";
     private long lastPollTime = 0;
     private long lastDmPollTime = 0;
+    private long reactingToMessageId = 0;
+    private ReactionButton visibleReactionButton = null;
     private static final long POLL_INTERVAL_MS = 3000;
     private static final long DM_POLL_INTERVAL_MS = 10000;
     private final Map<String, Long> latestDmMessageIds = new HashMap<>();
@@ -143,6 +148,10 @@ public class ZulipBridgeScreen extends Screen {
 
     @Override
     protected void init() {
+        CustomEmojiRegistry.refreshAsync(this.config, () ->
+                net.minecraft.client.MinecraftClient.getInstance().execute(() -> {
+                    if (!this.messages.isEmpty()) this.rebuildMessageLines();
+                }));
         String previousTopic = this.topicField != null ? this.topicField.getText() : "";
         String previousMessage = this.messageField != null ? this.messageField.getText() : "";
 
@@ -270,13 +279,15 @@ public class ZulipBridgeScreen extends Screen {
         long now = System.currentTimeMillis();
         if (now - this.lastPollTime >= POLL_INTERVAL_MS && !this.loadingMessages && !this.sendingMessage) {
             this.lastPollTime = now;
-            
+
             if (this.showingDirectMessages && this.selectedUserId != null && !this.composingNewDm) {
                 this.pollDirectMessages(this.selectedUserId);
             } else if (!this.showingDirectMessages && this.selectedChannel != null) {
                 this.pollMessages(this.selectedChannel);
             }
         }
+
+
         
         if (this.pollAllConversations) {
             if (now - this.lastDmPollTime >= DM_POLL_INTERVAL_MS && !this.loadingChannels && this.showingDirectMessages) {
@@ -410,6 +421,28 @@ public class ZulipBridgeScreen extends Screen {
         });
     }
     
+    /**
+     * Called from the polling thread (via {@code client.execute()}) when a
+     * reaction add/remove event arrives for a message currently displayed.
+     * Updates the reaction count in-place and redraws the message lines.
+     */
+    public void onReactionEvent(long messageId, String emojiName, String op) {
+        for (int i = 0; i < this.messages.size(); i++) {
+            ZulipMessage m = this.messages.get(i);
+            if (m.id() != messageId) continue;
+
+            Map<String, Integer> updated = new java.util.LinkedHashMap<>(m.reactions());
+            if ("add".equals(op)) {
+                updated.merge(emojiName, 1, Integer::sum);
+            } else if ("remove".equals(op)) {
+                updated.computeIfPresent(emojiName, (k, v) -> v <= 1 ? null : v - 1);
+            }
+            this.messages.set(i, new ZulipMessage(m.id(), m.sender(), m.topic(), m.content(), m.imageHashes(), updated));
+            this.rebuildMessageLines();
+            return;
+        }
+    }
+
     private void pollDirectMessages(String userId) {
         final String targetUserId = userId;
         Thread.ofVirtual().name("ZulipBridgeGuiPollDM").start(() -> {
@@ -487,7 +520,7 @@ public class ZulipBridgeScreen extends Screen {
         );
 
         this.drawChannelsPanel(context, mouseX, mouseY);
-        this.drawMessagesPanel(context);
+        this.drawMessagesPanel(context, mouseX, mouseY);
         
         if (this.showingPollSettings) {
             this.drawPollSettingsPanel(context, mouseX, mouseY);
@@ -605,7 +638,15 @@ public class ZulipBridgeScreen extends Screen {
         int rowIndex = (mouseY - this.mentionSuggestionsY - 4) / MENTION_SUGGESTION_ROW_HEIGHT;
         if (rowIndex < 0 || rowIndex >= this.mentionSuggestions.size()) return false;
 
-        this.applyMentionSuggestion(this.mentionSuggestions.get(rowIndex));
+        if (this.reactingToMessageId != 0) {
+            String shortcode = this.mentionSuggestions.get(rowIndex).insertText();
+            this.mentionSuggestions.clear();
+            this.mentionTokenStart = -1;
+            this.mentionTokenEnd = -1;
+            this.sendReaction(this.reactingToMessageId, shortcode);
+        } else {
+            this.applyMentionSuggestion(this.mentionSuggestions.get(rowIndex));
+        }
         return true;
     }
 
@@ -647,7 +688,7 @@ public class ZulipBridgeScreen extends Screen {
 
         if (PreviewHud.isActive()) {
             if (button == 0) {
-                PreviewHud.handleClick(mouseX, mouseY);
+                PreviewHud.handleMousePressed(mouseX, mouseY);
             }
             return true;
         }
@@ -655,6 +696,17 @@ public class ZulipBridgeScreen extends Screen {
         if (super.mouseClicked(click, doubleClick)) return true;
 
         if (button == 0 && this.handleMentionSuggestionClick((int) mouseX, (int) mouseY)) {
+            return true;
+        }
+
+        if (button == 0 && this.visibleReactionButton != null
+                && this.visibleReactionButton.contains((int) mouseX, (int) mouseY)) {
+            long msgId = this.visibleReactionButton.messageId();
+            if (this.reactingToMessageId == msgId) {
+                this.cancelReactionMode();
+            } else {
+                this.enterReactionMode(msgId);
+            }
             return true;
         }
 
@@ -722,6 +774,10 @@ public class ZulipBridgeScreen extends Screen {
 
     @Override
     public boolean mouseScrolled(double mouseX, double mouseY, double horizontalAmount, double verticalAmount) {
+        if (PreviewHud.isActive()) {
+            PreviewHud.handleScroll(mouseX, mouseY, verticalAmount);
+            return true;
+        }
         if (verticalAmount == 0) return super.mouseScrolled(mouseX, mouseY, horizontalAmount, verticalAmount);
 
         int direction = verticalAmount > 0 ? -1 : 1;
@@ -740,18 +796,49 @@ public class ZulipBridgeScreen extends Screen {
 
     @Override
     public boolean keyPressed(KeyInput keyInput) {
+        if (PreviewHud.isActive()) {
+            int keyCode = keyInput.key();
+            if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
+                PreviewHud.close();
+                return true;
+            }
+            return true;
+        }
+
         int keyCode = keyInput.key();
+
+        if (keyCode == GLFW.GLFW_KEY_ESCAPE && this.reactingToMessageId != 0) {
+            this.cancelReactionMode();
+            return true;
+        }
+
         boolean acceptingSuggestion = this.messageField != null
                 && this.messageField.isFocused()
                 && !this.mentionSuggestions.isEmpty();
 
         if (keyCode == GLFW.GLFW_KEY_TAB && acceptingSuggestion) {
-            this.applyMentionSuggestion(this.mentionSuggestions.getFirst());
+            if (this.reactingToMessageId != 0) {
+                String shortcode = this.mentionSuggestions.getFirst().insertText();
+                this.mentionSuggestions.clear();
+                this.mentionTokenStart = -1;
+                this.mentionTokenEnd = -1;
+                this.sendReaction(this.reactingToMessageId, shortcode);
+            } else {
+                this.applyMentionSuggestion(this.mentionSuggestions.getFirst());
+            }
             return true;
         }
 
         if ((keyCode == GLFW.GLFW_KEY_ENTER || keyCode == GLFW.GLFW_KEY_KP_ENTER) && acceptingSuggestion) {
-            this.applyMentionSuggestion(this.mentionSuggestions.getFirst());
+            if (this.reactingToMessageId != 0) {
+                String shortcode = this.mentionSuggestions.getFirst().insertText();
+                this.mentionSuggestions.clear();
+                this.mentionTokenStart = -1;
+                this.mentionTokenEnd = -1;
+                this.sendReaction(this.reactingToMessageId, shortcode);
+            } else {
+                this.applyMentionSuggestion(this.mentionSuggestions.getFirst());
+            }
             return true;
         }
 
@@ -940,10 +1027,11 @@ public class ZulipBridgeScreen extends Screen {
         }
     }
 
-    private void drawMessagesPanel(DrawContext context) {
+    private void drawMessagesPanel(DrawContext context, int mouseX, int mouseY) {
         int x2 = this.messagesX + this.messagesWidth;
         int y2 = this.messagesY + this.messagesHeight;
         this.previewableImages.clear();
+        this.visibleReactionButton = null;
 
         context.fill(this.messagesX, this.messagesY, x2, y2, 0xAA101015);
         drawBorder(context, this.messagesX, this.messagesY, this.messagesWidth, this.messagesHeight, 0xFF2F2F3F);
@@ -965,12 +1053,35 @@ public class ZulipBridgeScreen extends Screen {
         }
 
         this.messageScroll = clamp(this.messageScroll, 0, this.maxMessageScroll());
+        int panelTop = this.messagesY + PANEL_HEADER_HEIGHT + 2;
+        int panelBottom = this.messagesY + this.messagesHeight - 8;
+
+        // Pre-pass: find which message (if any) the mouse is currently hovering over.
+        long hoveredMsgId = 0;
+        boolean mouseInPanel = mouseX >= this.messagesX && mouseX < this.messagesX + this.messagesWidth
+                && mouseY >= panelTop && mouseY < panelBottom;
+        if (mouseInPanel) {
+            for (int i = 0; i < visibleLines; i++) {
+                int lineIndex = this.messageScroll + i;
+                if (lineIndex >= this.renderedMessageLines.size()) break;
+                DisplayLine line = this.renderedMessageLines.get(lineIndex);
+                int y = lineTop + i * MESSAGE_LINE_HEIGHT;
+                if (mouseY >= y && mouseY < y + MESSAGE_LINE_HEIGHT && line.messageId() != 0) {
+                    hoveredMsgId = line.messageId();
+                    break;
+                }
+            }
+        }
+
+        context.enableScissor(this.messagesX, panelTop, this.messagesX + this.messagesWidth, panelBottom);
         for (int i = 0; i < visibleLines; i++) {
             int lineIndex = this.messageScroll + i;
             if (lineIndex >= this.renderedMessageLines.size()) break;
 
             DisplayLine line = this.renderedMessageLines.get(lineIndex);
             int y = lineTop + (i * MESSAGE_LINE_HEIGHT);
+            if (y + MESSAGE_LINE_HEIGHT < panelTop || y >= panelBottom) continue;
+
             if (line.imageHash() != null) {
                 if (line.imageSpacer()) continue;
 
@@ -988,7 +1099,40 @@ public class ZulipBridgeScreen extends Screen {
                 continue;
             }
 
-            context.drawTextWithShadow(this.textRenderer, line.text(), this.messagesX + 4, y, line.color());
+            drawInlineEmojiText(context, line, this.messagesX + 4, y);
+
+            // Draw the [+] reaction button on the header line of the hovered message.
+            if (line.isHeader() && line.messageId() == hoveredMsgId && hoveredMsgId != 0) {
+                int btnW = this.textRenderer.getWidth("[+]") + 4;
+                int btnX = this.messagesX + this.messagesWidth - btnW - 2;
+                int btnY = y;
+                boolean active = this.reactingToMessageId == hoveredMsgId;
+                int btnColor = active ? 0xFF88FF88 : 0xFFAABBFF;
+                context.fill(btnX - 1, btnY, btnX + btnW + 1, btnY + MESSAGE_LINE_HEIGHT, 0x60000000);
+                context.drawTextWithShadow(this.textRenderer, "[+]", btnX + 2, btnY + 1, btnColor);
+                this.visibleReactionButton = new ReactionButton(hoveredMsgId, btnX - 1, btnY, btnW + 2, MESSAGE_LINE_HEIGHT);
+            }
+        }
+        context.disableScissor();
+    }
+
+    private void drawInlineEmojiText(DrawContext context, DisplayLine line, int x, int y) {
+        context.drawTextWithShadow(this.textRenderer, line.text(), x, y, line.color());
+        if (line.inlineEmojiHashes().isEmpty()) return;
+
+        int emojiIndex = 0;
+        for (int i = 0; i < line.text().length() && emojiIndex < line.inlineEmojiHashes().size(); i++) {
+            if (line.text().charAt(i) != InlineEmoji.PLACEHOLDER) continue;
+
+            String imageHash = line.inlineEmojiHashes().get(emojiIndex++);
+            ImageCache.CachedImage image = ImageCache.lookup(imageHash);
+            if (image == null) continue;
+
+            int drawX = x + this.textRenderer.getWidth(line.text().substring(0, i));
+            int drawY = y - 1;
+            int size = MESSAGE_LINE_HEIGHT + 2;
+            ImageRenderer.draw(context, image, drawX, drawY, new ImageRenderer.Size(size, size));
+            this.previewableImages.add(new PreviewableImage(imageHash, drawX, drawY, size, size));
         }
     }
 
@@ -1223,6 +1367,7 @@ public class ZulipBridgeScreen extends Screen {
 
         this.selectedChannel = channel;
         this.messages.clear();
+        if (this.reactingToMessageId != 0) this.cancelReactionMode();
         this.rebuildMessageLines();
         this.loadMessages(channel);
         
@@ -1385,7 +1530,7 @@ public class ZulipBridgeScreen extends Screen {
                             ? message.get("content").getAsString()
                             : "";
 
-                    loadedMessages.add(new ZulipMessage(id, sender, topic, EmojiShortcodes.replace(stripMarkdownImageLinks(content)), collectMessageImageHashes(message, content)));
+                    loadedMessages.add(new ZulipMessage(id, sender, topic, EmojiShortcodes.replace(stripMarkdownImageLinks(content)), collectMessageImageHashes(message, content), buildReactionsMap(message)));
                 }
                 loadedMessages.sort(Comparator.comparingLong(ZulipMessage::id));
 
@@ -1497,6 +1642,7 @@ public class ZulipBridgeScreen extends Screen {
         this.selectedUserId = userId;
         this.selectedUserName = userName;
         this.messages.clear();
+        if (this.reactingToMessageId != 0) this.cancelReactionMode();
         this.rebuildMessageLines();
         this.loadDirectMessages(userId);
         
@@ -1604,7 +1750,7 @@ public class ZulipBridgeScreen extends Screen {
                             ? message.get("content").getAsString()
                             : "";
 
-                    loadedMessages.add(new ZulipMessage(id, sender, "", EmojiShortcodes.replace(stripMarkdownImageLinks(content)), collectMessageImageHashes(message, content)));
+                    loadedMessages.add(new ZulipMessage(id, sender, "", EmojiShortcodes.replace(stripMarkdownImageLinks(content)), collectMessageImageHashes(message, content), buildReactionsMap(message)));
                 }
                 loadedMessages.sort(Comparator.comparingLong(ZulipMessage::id));
 
@@ -1630,6 +1776,12 @@ public class ZulipBridgeScreen extends Screen {
 
     private void sendCurrentMessage() {
         if (this.sendingMessage) return;
+
+        if (this.reactingToMessageId != 0) {
+            String input = this.messageField != null ? this.messageField.getText() : "";
+            sendReaction(this.reactingToMessageId, input);
+            return;
+        }
 
         String validationError = validateAccountConfig(this.config);
         if (validationError != null) {
@@ -1717,6 +1869,13 @@ public class ZulipBridgeScreen extends Screen {
                 JsonObject body = JsonParser.parseString(response.body()).getAsJsonObject();
                 if (!"success".equals(body.get("result").getAsString())) {
                     throw new IllegalStateException(extractApiMessage(response.body()));
+                }
+
+                if (body.has("id")) {
+                    String source = this.showingDirectMessages
+                            ? "DM @" + targetUserName
+                            : "#" + channel + " > " + topic;
+                    ZulipPollingThread.addOwnMessageId(body.get("id").getAsLong(), source);
                 }
 
                 this.runOnClient(() -> {
@@ -1808,6 +1967,10 @@ public class ZulipBridgeScreen extends Screen {
                     throw new IllegalStateException(extractApiMessage(response.body()));
                 }
 
+                if (body.has("id")) {
+                    ZulipPollingThread.addOwnMessageId(body.get("id").getAsLong(), "DM @" + recipientInput.trim());
+                }
+
                 this.runOnClient(() -> {
                     this.sendingMessage = false;
                     if (this.messageField != null) {
@@ -1827,6 +1990,133 @@ public class ZulipBridgeScreen extends Screen {
         });
     }
 
+    private void enterReactionMode(long messageId) {
+        this.reactingToMessageId = messageId;
+        if (this.messageField != null) {
+            this.messageField.setText(":");
+            this.messageField.setPlaceholder(Text.literal("Emoji name..."));
+            this.setFocused(this.messageField);
+            // Move cursor to end so autocomplete triggers immediately.
+            this.messageField.setCursorToEnd(false);
+        }
+        this.updateButtons();
+    }
+
+    private void cancelReactionMode() {
+        this.reactingToMessageId = 0;
+        if (this.messageField != null) {
+            this.messageField.setText("");
+            this.messageField.setPlaceholder(Text.literal("Message"));
+        }
+        this.updateButtons();
+    }
+
+    private void sendReaction(long messageId, String emojiInput) {
+        ZulipBridgeClient.LOGGER.info("sendReaction called: messageId={}, input='{}'", messageId, emojiInput);
+
+        String validationError = validateAccountConfig(this.config);
+        if (validationError != null) {
+            this.statusMessage = validationError;
+            this.updateButtons();
+            return;
+        }
+
+        // Parse the shortcode: strip surrounding colons and whitespace.
+        String name = emojiInput.trim()
+                .replaceAll("^:+", "")
+                .replaceAll(":+\\s*$", "")
+                .trim();
+
+        ZulipBridgeClient.LOGGER.info("sendReaction: parsed name='{}'", name);
+
+        if (name.isBlank()) {
+            this.statusMessage = "Enter an emoji name (e.g. :thumbs_up:).";
+            this.updateButtons();
+            return;
+        }
+
+        // Determine emoji_code and reaction_type.
+        String unicode = EmojiShortcodes.get(name);
+        final String emojiCode;
+        final String reactionType;
+        if (unicode != null) {
+            // Build code from Unicode codepoints, e.g. "1f44d" or "1f1fa-1f1f8".
+            int[] codePoints = unicode.codePoints().toArray();
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < codePoints.length; i++) {
+                if (i > 0) sb.append('-');
+                sb.append(Integer.toHexString(codePoints[i]));
+            }
+            emojiCode = sb.toString();
+            reactionType = "unicode_emoji";
+        } else {
+            // Fall back: treat as a Zulip extra emoji (name == code).
+            emojiCode = name;
+            reactionType = "zulip_extra_emoji";
+        }
+
+        final String finalName = name;
+        final long finalMessageId = messageId;
+
+        this.sendingMessage = true;
+        this.statusMessage = "Sending reaction...";
+        this.updateButtons();
+
+        Thread.ofVirtual().name("ZulipBridgeGuiReact").start(() -> {
+            try {
+                String form = "emoji_name=" + URLEncoder.encode(finalName, StandardCharsets.UTF_8)
+                        + "&emoji_code=" + URLEncoder.encode(emojiCode, StandardCharsets.UTF_8)
+                        + "&reaction_type=" + URLEncoder.encode(reactionType, StandardCharsets.UTF_8);
+
+                String url = normalizeBaseUrl(this.config.zulipBaseUrl())
+                        + "/api/v1/messages/" + finalMessageId + "/reactions";
+                ZulipBridgeClient.LOGGER.info("sendReaction POST {} body={}", url, form);
+
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .header("Authorization", buildAuthHeader(this.config))
+                        .header("Content-Type", "application/x-www-form-urlencoded")
+                        .timeout(Duration.ofSeconds(10))
+                        .POST(HttpRequest.BodyPublishers.ofString(form))
+                        .build();
+
+                HttpResponse<String> response = this.httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                ZulipBridgeClient.LOGGER.info("sendReaction response: {} {}", response.statusCode(), response.body());
+
+                this.runOnClient(() -> {
+                    this.sendingMessage = false;
+                    this.reactingToMessageId = 0;
+                    if (this.messageField != null) {
+                        this.messageField.setText("");
+                        this.messageField.setPlaceholder(Text.literal("Message"));
+                    }
+                    if (response.statusCode() != 200) {
+                        this.statusMessage = "Reaction failed: HTTP " + response.statusCode();
+                    } else {
+                        JsonObject body = JsonParser.parseString(response.body()).getAsJsonObject();
+                        if (!"success".equals(body.get("result").getAsString())) {
+                            this.statusMessage = "Reaction failed: " + extractApiMessage(response.body());
+                        } else {
+                            this.statusMessage = "Reacted :" + finalName + ":";
+                        }
+                    }
+                    this.updateButtons();
+                });
+            } catch (Exception e) {
+                this.runOnClient(() -> {
+                    this.sendingMessage = false;
+                    this.reactingToMessageId = 0;
+                    if (this.messageField != null) {
+                        this.messageField.setText("");
+                        this.messageField.setPlaceholder(Text.literal("Message"));
+                    }
+                    this.statusMessage = "Reaction failed: " + e.getMessage();
+                    this.updateButtons();
+                });
+            }
+        });
+    }
+
     private void updateButtons() {
         if (this.refreshButton != null) {
             this.refreshButton.active = !this.loadingChannels;
@@ -1835,16 +2125,22 @@ public class ZulipBridgeScreen extends Screen {
         if (this.sendButton != null) {
             boolean hasMessage = this.messageField != null && !this.messageField.getText().isBlank();
             boolean canSend;
-            if (this.showingDirectMessages) {
-                if (this.composingNewDm) {
-                    canSend = this.newRecipientField != null && !this.newRecipientField.getText().isBlank() && hasMessage;
-                } else {
-                    canSend = this.selectedUserId != null && !this.selectedUserId.isBlank() && hasMessage;
-                }
+            if (this.reactingToMessageId != 0) {
+                this.sendButton.setMessage(Text.literal("React"));
+                canSend = hasMessage;
             } else {
-                boolean hasChannel = this.selectedChannel != null && !this.selectedChannel.isBlank();
-                boolean hasTopic = this.topicField != null && !this.topicField.getText().isBlank();
-                canSend = hasChannel && hasTopic && hasMessage;
+                this.sendButton.setMessage(Text.literal("Send"));
+                if (this.showingDirectMessages) {
+                    if (this.composingNewDm) {
+                        canSend = this.newRecipientField != null && !this.newRecipientField.getText().isBlank() && hasMessage;
+                    } else {
+                        canSend = this.selectedUserId != null && !this.selectedUserId.isBlank() && hasMessage;
+                    }
+                } else {
+                    boolean hasChannel = this.selectedChannel != null && !this.selectedChannel.isBlank();
+                    boolean hasTopic = this.topicField != null && !this.topicField.getText().isBlank();
+                    canSend = hasChannel && hasTopic && hasMessage;
+                }
             }
             this.sendButton.active = !this.sendingMessage && canSend;
         }
@@ -1981,12 +2277,18 @@ public class ZulipBridgeScreen extends Screen {
         }
 
         for (ZulipMessage message : this.messages) {
+            long msgId = message.id();
             String topic = (message.topic() == null || message.topic().isBlank()) ? "(no topic)" : message.topic();
             String sender = (message.sender() == null || message.sender().isBlank()) ? "Unknown" : message.sender();
             String header = "[" + topic + "] " + sender;
 
-            for (String wrappedHeader : wrapText(header, maxLineWidth)) {
-                this.renderedMessageLines.add(new DisplayLine(wrappedHeader, 0xFF67D0FF));
+            List<String> wrappedHeaders = wrapText(header, maxLineWidth);
+            for (int hi = 0; hi < wrappedHeaders.size(); hi++) {
+                if (hi == 0) {
+                    this.renderedMessageLines.add(DisplayLine.header(wrappedHeaders.get(hi), 0xFF67D0FF, msgId));
+                } else {
+                    this.renderedMessageLines.add(DisplayLine.content(wrappedHeaders.get(hi), 0xFF67D0FF, List.of(), msgId));
+                }
             }
 
             String formatted = applyFormattingCodes(message.content());
@@ -1995,18 +2297,30 @@ public class ZulipBridgeScreen extends Screen {
             }
 
             if (!formatted.isBlank()) {
-                List<String> wrappedContent = wrapText(formatted, Math.max(20, maxLineWidth - 10));
+                InlineEmojiContent inlineEmojiContent = replaceCustomEmojiWithPlaceholders(formatted);
+                List<String> wrappedContent = wrapText(inlineEmojiContent.text(), Math.max(20, maxLineWidth - 10));
+                int inlineEmojiIndex = 0;
                 for (String wrappedLine : wrappedContent) {
-                    this.renderedMessageLines.add(new DisplayLine("  " + wrappedLine, 0xFFFFFFFF));
+                    List<String> lineInlineEmojis = InlineEmoji.slice(inlineEmojiContent.imageHashes(), inlineEmojiIndex, InlineEmoji.countPlaceholders(wrappedLine));
+                    inlineEmojiIndex += lineInlineEmojis.size();
+                    this.renderedMessageLines.add(DisplayLine.content("  " + wrappedLine, 0xFFFFFFFF, lineInlineEmojis, msgId));
                 }
             }
 
             for (String imageHash : message.imageHashes()) {
-                this.renderedMessageLines.add(DisplayLine.image(imageHash));
+                this.renderedMessageLines.add(DisplayLine.image(imageHash, msgId));
                 for (int i = 1; i < GUI_IMAGE_ROW_SPAN; i++) {
-                    this.renderedMessageLines.add(DisplayLine.imageSpacer(imageHash));
+                    this.renderedMessageLines.add(DisplayLine.imageSpacer(imageHash, msgId));
                 }
             }
+
+            String reactionsText = formatReactions(message.reactions());
+            if (!reactionsText.isBlank()) {
+                for (String wrappedReaction : wrapText(reactionsText, maxLineWidth)) {
+                    this.renderedMessageLines.add(DisplayLine.content("  " + wrappedReaction, 0xFFD4C050, List.of(), msgId));
+                }
+            }
+
             this.renderedMessageLines.add(new DisplayLine("", 0xFFFFFFFF));
         }
 
@@ -2015,10 +2329,113 @@ public class ZulipBridgeScreen extends Screen {
 
     private String applyFormattingCodes(String content) {
         if (content == null || content.isEmpty()) return "";
-        return content
-                .replace("**", "\u00A7l\u00A7r")
-                .replace("*", "\u00A7o\u00A7r")
-                .replace("`", "\u00A77\u00A7r");
+
+        StringBuilder sb = new StringBuilder();
+        String[] lines = content.split("\\R", -1);
+        boolean inCodeBlock = false;
+
+        for (int li = 0; li < lines.length; li++) {
+            if (li > 0) sb.append('\n');
+            String line = lines[li];
+
+            if (line.startsWith("```")) {
+                inCodeBlock = !inCodeBlock;
+                // Omit the delimiter line itself
+                if (li > 0) {
+                    // Remove the trailing newline we just appended for the delimiter
+                    int len = sb.length();
+                    if (len > 0 && sb.charAt(len - 1) == '\n') sb.deleteCharAt(len - 1);
+                }
+                continue;
+            }
+
+            if (inCodeBlock) {
+                sb.append("\u00A77").append(line).append("\u00A7r");
+                continue;
+            }
+
+            // Headings: # … through ######
+            int hashes = 0;
+            while (hashes < line.length() && line.charAt(hashes) == '#') hashes++;
+            if (hashes > 0 && hashes <= 6 && hashes < line.length() && line.charAt(hashes) == ' ') {
+                String headingText = line.substring(hashes + 1);
+                sb.append("\u00A7l\u00A7b").append(applyInlineFormattingCodes(headingText)).append("\u00A7r");
+                continue;
+            }
+
+            // Block quote: > text
+            if (line.startsWith("> ") || line.equals(">")) {
+                String quoteText = line.length() > 2 ? line.substring(2) : "";
+                sb.append("\u00A77| \u00A7o").append(applyInlineFormattingCodes(quoteText)).append("\u00A7r");
+                continue;
+            }
+
+            // List items: - / * / + / 1.
+            java.util.regex.Matcher listM = java.util.regex.Pattern.compile("^(\\s*)([-*+]\\s+|\\d+\\.\\s+)(.*)$").matcher(line);
+            if (listM.matches()) {
+                String indent = listM.group(1);
+                sb.append(indent).append("\u00A79\u2022 \u00A7r").append(applyInlineFormattingCodes(listM.group(3)));
+                continue;
+            }
+
+            sb.append(applyInlineFormattingCodes(line));
+        }
+
+        return sb.toString();
+    }
+
+    private String applyInlineFormattingCodes(String text) {
+        if (text == null || text.isEmpty()) return "";
+        StringBuilder result = new StringBuilder();
+        int i = 0;
+        while (i < text.length()) {
+            char c = text.charAt(i);
+
+            // **bold**
+            if (c == '*' && i + 1 < text.length() && text.charAt(i + 1) == '*') {
+                int end = text.indexOf("**", i + 2);
+                if (end > i + 1) {
+                    result.append("\u00A7l").append(applyInlineFormattingCodes(text.substring(i + 2, end))).append("\u00A7r");
+                    i = end + 2;
+                    continue;
+                }
+            }
+
+            // ~~strikethrough~~
+            if (c == '~' && i + 1 < text.length() && text.charAt(i + 1) == '~') {
+                int end = text.indexOf("~~", i + 2);
+                if (end > i + 1) {
+                    result.append("\u00A7m").append(applyInlineFormattingCodes(text.substring(i + 2, end))).append("\u00A7r");
+                    i = end + 2;
+                    continue;
+                }
+            }
+
+            // *italic* (single asterisk, not part of **)
+            if (c == '*' && (i + 1 >= text.length() || text.charAt(i + 1) != '*')) {
+                int end = i + 1;
+                while (end < text.length() && text.charAt(end) != '*') end++;
+                if (end < text.length() && end > i + 1) {
+                    result.append("\u00A7o").append(applyInlineFormattingCodes(text.substring(i + 1, end))).append("\u00A7r");
+                    i = end + 1;
+                    continue;
+                }
+            }
+
+            // `inline code`
+            if (c == '`') {
+                int end = text.indexOf('`', i + 1);
+                if (end > i) {
+                    result.append("\u00A77").append(text, i + 1, end).append("\u00A7r");
+                    i = end + 1;
+                    continue;
+                }
+            }
+
+            result.append(c);
+            i++;
+        }
+        return result.toString();
     }
 
     private List<String> wrapText(String text, int maxWidth) {
@@ -2058,6 +2475,28 @@ public class ZulipBridgeScreen extends Screen {
         }
 
         return lines;
+    }
+
+    private InlineEmojiContent replaceCustomEmojiWithPlaceholders(String content) {
+        if (content == null || content.isEmpty()) return new InlineEmojiContent("", List.of());
+
+        Matcher matcher = SHORTCODE_PATTERN.matcher(content);
+        StringBuilder result = new StringBuilder();
+        List<String> imageHashes = new ArrayList<>();
+        while (matcher.find()) {
+            CustomEmojiRegistry.CustomEmoji customEmoji = CustomEmojiRegistry.get(matcher.group(1));
+            if (customEmoji == null) {
+                matcher.appendReplacement(result, Matcher.quoteReplacement(matcher.group(0)));
+                continue;
+            }
+
+            String imageHash = ImageCache.hashUrl(customEmoji.url());
+            imageHashes.add(imageHash);
+            scheduleScreenImageLoad(imageHash, customEmoji.url());
+            matcher.appendReplacement(result, Matcher.quoteReplacement(InlineEmoji.PLACEHOLDER_TEXT));
+        }
+        matcher.appendTail(result);
+        return new InlineEmojiContent(result.toString(), imageHashes);
     }
 
     private void rebuildChannelRows() {
@@ -2228,6 +2667,35 @@ public class ZulipBridgeScreen extends Screen {
     private static String buildAuthHeader(ZulipBridgeConfig cfg) {
         String creds = cfg.botEmail() + ":" + cfg.botApiKey();
         return "Basic " + Base64.getEncoder().encodeToString(creds.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** Parses the {@code reactions} array from a message JSON object into an emoji→count map. */
+    private static Map<String, Integer> buildReactionsMap(JsonObject message) {
+        if (!message.has("reactions") || !message.get("reactions").isJsonArray()) return new java.util.LinkedHashMap<>();
+        JsonArray reactions = message.getAsJsonArray("reactions");
+        Map<String, Integer> counts = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < reactions.size(); i++) {
+            if (!reactions.get(i).isJsonObject()) continue;
+            JsonObject reaction = reactions.get(i).getAsJsonObject();
+            String emojiName = reaction.has("emoji_name") ? reaction.get("emoji_name").getAsString() : "";
+            if (!emojiName.isBlank()) {
+                counts.merge(emojiName, 1, Integer::sum);
+            }
+        }
+        return counts;
+    }
+
+    /** Formats an emoji→count map into a display string like {@code 👍 3  ❤️ 2}. */
+    private static String formatReactions(Map<String, Integer> reactions) {
+        if (reactions == null || reactions.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<String, Integer> entry : reactions.entrySet()) {
+            String unicode = EmojiShortcodes.get(entry.getKey());
+            String display = unicode != null ? unicode : ":" + entry.getKey() + ":";
+            if (!sb.isEmpty()) sb.append("  ");
+            sb.append(display).append(" ").append(entry.getValue());
+        }
+        return sb.toString();
     }
 
     private List<String> collectMessageImageHashes(JsonObject message, String content) {
@@ -2443,21 +2911,48 @@ public class ZulipBridgeScreen extends Screen {
     private record FolderInfo(String name, int order) {
     }
 
-    private record ZulipMessage(long id, String sender, String topic, String content, List<String> imageHashes) {
+    private record ZulipMessage(long id, String sender, String topic, String content, List<String> imageHashes, Map<String, Integer> reactions) {
     }
 
-    private record DisplayLine(String text, int color, String imageHash, boolean imageSpacer) {
+    private record DisplayLine(String text, int color, String imageHash, boolean imageSpacer, List<String> inlineEmojiHashes, long messageId, boolean isHeader) {
+        /** Non-message line (placeholder, separator, etc.). */
         DisplayLine(String text, int color) {
-            this(text, color, null, false);
+            this(text, color, null, false, List.of(), 0, false);
+        }
+
+        static DisplayLine header(String text, int color, long messageId) {
+            return new DisplayLine(text, color, null, false, List.of(), messageId, true);
+        }
+
+        static DisplayLine content(String text, int color, List<String> inlineEmojiHashes, long messageId) {
+            return new DisplayLine(text, color, null, false, inlineEmojiHashes, messageId, false);
         }
 
         static DisplayLine image(String imageHash) {
-            return new DisplayLine("", 0xFFFFFFFF, imageHash, false);
+            return new DisplayLine("", 0xFFFFFFFF, imageHash, false, List.of(), 0, false);
+        }
+
+        static DisplayLine image(String imageHash, long messageId) {
+            return new DisplayLine("", 0xFFFFFFFF, imageHash, false, List.of(), messageId, false);
         }
 
         static DisplayLine imageSpacer(String imageHash) {
-            return new DisplayLine("", 0xFFFFFFFF, imageHash, true);
+            return new DisplayLine("", 0xFFFFFFFF, imageHash, true, List.of(), 0, false);
         }
+
+        static DisplayLine imageSpacer(String imageHash, long messageId) {
+            return new DisplayLine("", 0xFFFFFFFF, imageHash, true, List.of(), messageId, false);
+        }
+    }
+
+    /** Bounds of the [+] reaction button currently visible on screen, null if none. */
+    private record ReactionButton(long messageId, int x, int y, int w, int h) {
+        boolean contains(int mx, int my) {
+            return mx >= x && mx < x + w && my >= y && my < y + h;
+        }
+    }
+
+    private record InlineEmojiContent(String text, List<String> imageHashes) {
     }
 
     private record UserEntry(String id, String name, String email) {

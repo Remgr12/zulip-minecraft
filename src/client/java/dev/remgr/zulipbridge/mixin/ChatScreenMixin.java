@@ -28,9 +28,18 @@ public class ChatScreenMixin {
     private void zulipBridge$blockClicksWhilePreviewOpen(Click click, boolean doubleClick, CallbackInfoReturnable<Boolean> cir) {
         if (!PreviewHud.isActive()) return;
         if (click.button() == 0) {
-            PreviewHud.handleClick(click.x(), click.y());
+            PreviewHud.handleMousePressed(click.x(), click.y());
         }
         cir.setReturnValue(true);
+    }
+
+    @Inject(method = "mouseScrolled(DDDD)Z", at = @At("HEAD"), cancellable = true)
+    private void zulipBridge$scrollWhilePreviewOpen(double mouseX, double mouseY, double horizontalAmount, double verticalAmount, CallbackInfoReturnable<Boolean> cir) {
+        if (PreviewHud.handleScroll(mouseX, mouseY, verticalAmount)) {
+            cir.setReturnValue(true);
+        } else if (PreviewHud.isActive()) {
+            cir.setReturnValue(true);
+        }
     }
 
     @Inject(method = "sendMessage(Ljava/lang/String;Z)V", at = @At("HEAD"), cancellable = true)

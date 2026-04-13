@@ -16,9 +16,11 @@ public final class ChatImageRegistry {
     private static final int MAX_DISPLAY_MAPPINGS = 256;
 
     private static final Map<String, List<ChatImageThumbnail>> THUMBNAILS_BY_MESSAGE = new HashMap<>();
+    private static final Map<String, List<String>> INLINE_EMOJIS_BY_MESSAGE = new HashMap<>();
     private static final Map<Text, String> MESSAGE_BY_DISPLAY = new IdentityHashMap<>();
     private static final ArrayDeque<Text> DISPLAY_ORDER = new ArrayDeque<>();
     private static final Map<ChatHudLine.Visible, String> MESSAGE_BY_VISIBLE_LINE = new IdentityHashMap<>();
+    private static final Map<ChatHudLine.Visible, Integer> INLINE_EMOJI_START_BY_VISIBLE_LINE = new IdentityHashMap<>();
     private static final ArrayDeque<ChatHudLine.Visible> VISIBLE_LINE_ORDER = new ArrayDeque<>();
     private static final Map<String, ArrayDeque<String>> MESSAGE_HASHES_BY_LINE_TEXT = new HashMap<>();
     private static final ArrayDeque<String> LINE_TEXT_ORDER = new ArrayDeque<>();
@@ -35,6 +37,22 @@ public final class ChatImageRegistry {
         }
     }
 
+    public static synchronized void clearInlineEmojis(String messageHash) {
+        if (messageHash == null || messageHash.isBlank()) return;
+        INLINE_EMOJIS_BY_MESSAGE.remove(messageHash);
+    }
+
+    public static synchronized void addInlineEmoji(String messageHash, String imageHash) {
+        if (messageHash == null || messageHash.isBlank() || imageHash == null || imageHash.isBlank()) return;
+        INLINE_EMOJIS_BY_MESSAGE.computeIfAbsent(messageHash, ignored -> new ArrayList<>()).add(imageHash);
+    }
+
+    public static synchronized List<String> getInlineEmojis(String messageHash) {
+        if (messageHash == null || messageHash.isBlank()) return Collections.emptyList();
+        List<String> emojis = INLINE_EMOJIS_BY_MESSAGE.get(messageHash);
+        return emojis == null ? Collections.emptyList() : List.copyOf(emojis);
+    }
+
     public static synchronized void bindDisplayText(String messageHash, Text displayText) {
         if (displayText == null || messageHash == null || messageHash.isBlank()) return;
 
@@ -49,9 +67,14 @@ public final class ChatImageRegistry {
     }
 
     public static synchronized void bindVisibleLine(ChatHudLine.Visible visibleLine, String messageHash) {
+        bindVisibleLine(visibleLine, messageHash, 0);
+    }
+
+    public static synchronized void bindVisibleLine(ChatHudLine.Visible visibleLine, String messageHash, int inlineEmojiStartIndex) {
         if (visibleLine == null || messageHash == null || messageHash.isBlank()) return;
 
         MESSAGE_BY_VISIBLE_LINE.put(visibleLine, messageHash);
+        INLINE_EMOJI_START_BY_VISIBLE_LINE.put(visibleLine, Math.max(0, inlineEmojiStartIndex));
         VISIBLE_LINE_ORDER.addLast(visibleLine);
         trimVisibleLines();
     }
@@ -67,6 +90,11 @@ public final class ChatImageRegistry {
     public static synchronized String findMessageHashForVisibleLine(ChatHudLine.Visible visibleLine) {
         if (visibleLine == null) return null;
         return MESSAGE_BY_VISIBLE_LINE.get(visibleLine);
+    }
+
+    public static synchronized int findInlineEmojiStartForVisibleLine(ChatHudLine.Visible visibleLine) {
+        if (visibleLine == null) return 0;
+        return INLINE_EMOJI_START_BY_VISIBLE_LINE.getOrDefault(visibleLine, 0);
     }
 
     public static synchronized String findMessageHashForLineText(String lineText, int occurrenceIndex) {
@@ -111,9 +139,11 @@ public final class ChatImageRegistry {
 
     public static synchronized void clear() {
         THUMBNAILS_BY_MESSAGE.clear();
+        INLINE_EMOJIS_BY_MESSAGE.clear();
         MESSAGE_BY_DISPLAY.clear();
         DISPLAY_ORDER.clear();
         MESSAGE_BY_VISIBLE_LINE.clear();
+        INLINE_EMOJI_START_BY_VISIBLE_LINE.clear();
         VISIBLE_LINE_ORDER.clear();
         MESSAGE_HASHES_BY_LINE_TEXT.clear();
         LINE_TEXT_ORDER.clear();
@@ -131,6 +161,7 @@ public final class ChatImageRegistry {
         while (VISIBLE_LINE_ORDER.size() > MAX_LINE_MAPPINGS) {
             ChatHudLine.Visible oldest = VISIBLE_LINE_ORDER.removeFirst();
             MESSAGE_BY_VISIBLE_LINE.remove(oldest);
+            INLINE_EMOJI_START_BY_VISIBLE_LINE.remove(oldest);
         }
     }
 
