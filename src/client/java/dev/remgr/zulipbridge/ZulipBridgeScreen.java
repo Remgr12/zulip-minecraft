@@ -20,6 +20,7 @@ import net.minecraft.client.gui.widget.TextFieldWidget;
 import net.minecraft.text.Style;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
+import net.minecraft.util.Util;
 import org.lwjgl.glfw.GLFW;
 
 import java.net.URI;
@@ -67,6 +68,7 @@ public class ZulipBridgeScreen extends Screen {
     private static final int MENTION_SUGGESTION_ROW_HEIGHT = 14;
     private static final Pattern MARKDOWN_LINK_PATTERN = Pattern.compile("\\[([^\\]]+)]\\(((?:[^()]|\\([^)]*\\))+?)\\)");
     private static final Pattern SHORTCODE_PATTERN = Pattern.compile(":([a-z0-9_+\\-]+):", Pattern.CASE_INSENSITIVE);
+    private static final Pattern URL_PATTERN = Pattern.compile("(https?://\\S+)");
     private static final Pattern USER_UPLOAD_PATH_PATTERN = Pattern.compile("^/user_uploads/([^/]+)/(.*)$");
     private static final Set<String> PERSISTED_POLLED_CHANNELS = new HashSet<>();
     private static boolean PERSISTED_POLL_ALL_CONVERSATIONS = false;
@@ -760,7 +762,53 @@ public class ZulipBridgeScreen extends Screen {
             return true;
         }
 
+        // Shift+click on a link in the message panel → open in browser
+        long windowHandle = MinecraftClient.getInstance().getWindow().getHandle();
+        boolean shiftHeld = GLFW.glfwGetKey(windowHandle, GLFW.GLFW_KEY_LEFT_SHIFT) == GLFW.GLFW_PRESS
+                || GLFW.glfwGetKey(windowHandle, GLFW.GLFW_KEY_RIGHT_SHIFT) == GLFW.GLFW_PRESS;
+        if (button == 0 && shiftHeld && isInsideMessages(mouseX, mouseY)) {
+            String linkUrl = findLinkAtMessagePosition((int) mouseX, (int) mouseY);
+            if (linkUrl != null) {
+                try {
+                    Util.getOperatingSystem().open(new URI(linkUrl));
+                } catch (Exception e) {
+                    ZulipBridgeClient.LOGGER.warn("Failed to open link: {}", linkUrl);
+                }
+                return true;
+            }
+        }
+
         return false;
+    }
+
+    private String findLinkAtMessagePosition(int mouseX, int mouseY) {
+        int panelTop = this.messagesY + PANEL_HEADER_HEIGHT + 2;
+        int panelBottom = this.messagesY + this.messagesHeight - 8;
+        if (mouseY < panelTop || mouseY >= panelBottom) return null;
+
+        int lineTop = panelTop;
+        int visibleLines = this.visibleMessageRows();
+        int lineStartX = this.messagesX + 4;
+
+        for (int i = 0; i < visibleLines; i++) {
+            int lineIndex = this.messageScroll + i;
+            if (lineIndex >= this.renderedMessageLines.size()) break;
+
+            DisplayLine line = this.renderedMessageLines.get(lineIndex);
+            int lineY = lineTop + i * MESSAGE_LINE_HEIGHT;
+            if (mouseY < lineY || mouseY >= lineY + MESSAGE_LINE_HEIGHT) continue;
+            if (line.links().isEmpty()) continue;
+
+            for (LinkSpan span : line.links()) {
+                int pixelX1 = lineStartX + this.textRenderer.getWidth(line.text().substring(0, span.start()));
+                int pixelX2 = lineStartX + this.textRenderer.getWidth(line.text().substring(0, span.end()));
+                if (mouseX >= pixelX1 && mouseX < pixelX2) {
+                    return span.url();
+                }
+            }
+            break;
+        }
+        return null;
     }
 
     private boolean isInsidePollSettingsPanel(int mouseX, int mouseY) {
@@ -2291,19 +2339,26 @@ public class ZulipBridgeScreen extends Screen {
                 }
             }
 
-            String formatted = applyFormattingCodes(message.content());
+            FormattedContent formattedWithLinks = applyFormattingCodesWithLinks(message.content());
+            String formatted = formattedWithLinks.text();
             if (formatted.isBlank() && message.imageHashes().isEmpty()) {
                 formatted = "(no content)";
+                formattedWithLinks = new FormattedContent(formatted, List.of());
             }
 
             if (!formatted.isBlank()) {
                 InlineEmojiContent inlineEmojiContent = replaceCustomEmojiWithPlaceholders(formatted);
-                List<String> wrappedContent = wrapText(inlineEmojiContent.text(), Math.max(20, maxLineWidth - 10));
+                List<LinkSpan> adjustedLinks = adjustSpansForEmojiReplacements(formatted, formattedWithLinks.links());
+                List<WrappedSegment> wrappedSegments = wrapTextTracked(inlineEmojiContent.text(), Math.max(20, maxLineWidth - 10), adjustedLinks);
                 int inlineEmojiIndex = 0;
-                for (String wrappedLine : wrappedContent) {
+                for (WrappedSegment seg : wrappedSegments) {
+                    String wrappedLine = seg.text();
                     List<String> lineInlineEmojis = InlineEmoji.slice(inlineEmojiContent.imageHashes(), inlineEmojiIndex, InlineEmoji.countPlaceholders(wrappedLine));
                     inlineEmojiIndex += lineInlineEmojis.size();
-                    this.renderedMessageLines.add(DisplayLine.content("  " + wrappedLine, 0xFFFFFFFF, lineInlineEmojis, msgId));
+                    // Adjust link spans for the "  " indent prefix added below
+                    List<LinkSpan> prefixedLinks = new ArrayList<>(seg.links().size());
+                    for (LinkSpan s : seg.links()) prefixedLinks.add(new LinkSpan(s.start() + 2, s.end() + 2, s.url()));
+                    this.renderedMessageLines.add(DisplayLine.content("  " + wrappedLine, 0xFFFFFFFF, lineInlineEmojis, msgId, prefixedLinks));
                 }
             }
 
@@ -2328,9 +2383,14 @@ public class ZulipBridgeScreen extends Screen {
     }
 
     private String applyFormattingCodes(String content) {
-        if (content == null || content.isEmpty()) return "";
+        return applyFormattingCodesWithLinks(content).text();
+    }
+
+    private FormattedContent applyFormattingCodesWithLinks(String content) {
+        if (content == null || content.isEmpty()) return new FormattedContent("", List.of());
 
         StringBuilder sb = new StringBuilder();
+        List<LinkSpan> allLinks = new ArrayList<>();
         String[] lines = content.split("\\R", -1);
         boolean inCodeBlock = false;
 
@@ -2340,9 +2400,7 @@ public class ZulipBridgeScreen extends Screen {
 
             if (line.startsWith("```")) {
                 inCodeBlock = !inCodeBlock;
-                // Omit the delimiter line itself
                 if (li > 0) {
-                    // Remove the trailing newline we just appended for the delimiter
                     int len = sb.length();
                     if (len > 0 && sb.charAt(len - 1) == '\n') sb.deleteCharAt(len - 1);
                 }
@@ -2359,14 +2417,22 @@ public class ZulipBridgeScreen extends Screen {
             while (hashes < line.length() && line.charAt(hashes) == '#') hashes++;
             if (hashes > 0 && hashes <= 6 && hashes < line.length() && line.charAt(hashes) == ' ') {
                 String headingText = line.substring(hashes + 1);
-                sb.append("\u00A7l\u00A7b").append(applyInlineFormattingCodes(headingText)).append("\u00A7r");
+                sb.append("\u00A7l\u00A7b");
+                int base = sb.length();
+                FormattedContent inner = applyInlineFormattingCodesWithLinks(headingText);
+                sb.append(inner.text()).append("\u00A7r");
+                for (LinkSpan s : inner.links()) allLinks.add(new LinkSpan(base + s.start(), base + s.end(), s.url()));
                 continue;
             }
 
             // Block quote: > text
             if (line.startsWith("> ") || line.equals(">")) {
                 String quoteText = line.length() > 2 ? line.substring(2) : "";
-                sb.append("\u00A77| \u00A7o").append(applyInlineFormattingCodes(quoteText)).append("\u00A7r");
+                sb.append("\u00A77| \u00A7o");
+                int base = sb.length();
+                FormattedContent inner = applyInlineFormattingCodesWithLinks(quoteText);
+                sb.append(inner.text()).append("\u00A7r");
+                for (LinkSpan s : inner.links()) allLinks.add(new LinkSpan(base + s.start(), base + s.end(), s.url()));
                 continue;
             }
 
@@ -2374,28 +2440,101 @@ public class ZulipBridgeScreen extends Screen {
             java.util.regex.Matcher listM = java.util.regex.Pattern.compile("^(\\s*)([-*+]\\s+|\\d+\\.\\s+)(.*)$").matcher(line);
             if (listM.matches()) {
                 String indent = listM.group(1);
-                sb.append(indent).append("\u00A79\u2022 \u00A7r").append(applyInlineFormattingCodes(listM.group(3)));
+                sb.append(indent).append("\u00A79\u2022 \u00A7r");
+                int base = sb.length();
+                FormattedContent inner = applyInlineFormattingCodesWithLinks(listM.group(3));
+                sb.append(inner.text());
+                for (LinkSpan s : inner.links()) allLinks.add(new LinkSpan(base + s.start(), base + s.end(), s.url()));
                 continue;
             }
 
-            sb.append(applyInlineFormattingCodes(line));
+            int base = sb.length();
+            FormattedContent inner = applyInlineFormattingCodesWithLinks(line);
+            sb.append(inner.text());
+            for (LinkSpan s : inner.links()) allLinks.add(new LinkSpan(base + s.start(), base + s.end(), s.url()));
         }
 
-        return sb.toString();
+        return new FormattedContent(sb.toString(), allLinks);
     }
 
     private String applyInlineFormattingCodes(String text) {
-        if (text == null || text.isEmpty()) return "";
+        return applyInlineFormattingCodesWithLinks(text).text();
+    }
+
+    private FormattedContent applyInlineFormattingCodesWithLinks(String text) {
+        if (text == null || text.isEmpty()) return new FormattedContent("", List.of());
         StringBuilder result = new StringBuilder();
+        List<LinkSpan> spans = new ArrayList<>();
         int i = 0;
         while (i < text.length()) {
             char c = text.charAt(i);
+
+            // [label](url) markdown link
+            if (c == '[') {
+                Matcher m = MARKDOWN_LINK_PATTERN.matcher(text).region(i, text.length());
+                if (m.lookingAt()) {
+                    String label = m.group(1);
+                    String rawUrl = normalizeMarkdownLinkUrl(m.group(2));
+                    String resolved = resolveImageUrl(rawUrl);
+                    if (!resolved.isBlank() && !looksLikeImageReference(label, rawUrl)) {
+                        result.append("\u00A7n\u00A7b");
+                        int spanStart = result.length();
+                        result.append(label);
+                        int spanEnd = result.length();
+                        result.append("\u00A7r");
+                        spans.add(new LinkSpan(spanStart, spanEnd, resolved));
+                        i = m.end();
+                        continue;
+                    }
+                }
+            }
+
+            // Bare https?:// URL
+            if (c == 'h' && text.regionMatches(i, "http", 0, 4)) {
+                Matcher m = URL_PATTERN.matcher(text).region(i, text.length());
+                if (m.lookingAt()) {
+                    String url = m.group(1);
+                    // Strip trailing punctuation that is not part of the URL
+                    while (url.length() > 0) {
+                        char last = url.charAt(url.length() - 1);
+                        if (last == '.' || last == ',' || last == ')' || last == ']' || last == '\'' || last == '"') {
+                            url = url.substring(0, url.length() - 1);
+                        } else {
+                            break;
+                        }
+                    }
+                    if (!url.isBlank()) {
+                        result.append("\u00A7n\u00A7b");
+                        int spanStart = result.length();
+                        result.append(url);
+                        int spanEnd = result.length();
+                        result.append("\u00A7r");
+                        spans.add(new LinkSpan(spanStart, spanEnd, url));
+                        i += url.length();
+                        // Skip any punctuation we stripped
+                        while (i < text.length()) {
+                            char next = text.charAt(i);
+                            if (next == '.' || next == ',' || next == ')' || next == ']' || next == '\'' || next == '"') {
+                                result.append(next);
+                                i++;
+                            } else {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
 
             // **bold**
             if (c == '*' && i + 1 < text.length() && text.charAt(i + 1) == '*') {
                 int end = text.indexOf("**", i + 2);
                 if (end > i + 1) {
-                    result.append("\u00A7l").append(applyInlineFormattingCodes(text.substring(i + 2, end))).append("\u00A7r");
+                    result.append("\u00A7l");
+                    int innerBase = result.length();
+                    FormattedContent inner = applyInlineFormattingCodesWithLinks(text.substring(i + 2, end));
+                    result.append(inner.text()).append("\u00A7r");
+                    for (LinkSpan s : inner.links()) spans.add(new LinkSpan(innerBase + s.start(), innerBase + s.end(), s.url()));
                     i = end + 2;
                     continue;
                 }
@@ -2405,7 +2544,11 @@ public class ZulipBridgeScreen extends Screen {
             if (c == '~' && i + 1 < text.length() && text.charAt(i + 1) == '~') {
                 int end = text.indexOf("~~", i + 2);
                 if (end > i + 1) {
-                    result.append("\u00A7m").append(applyInlineFormattingCodes(text.substring(i + 2, end))).append("\u00A7r");
+                    result.append("\u00A7m");
+                    int innerBase = result.length();
+                    FormattedContent inner = applyInlineFormattingCodesWithLinks(text.substring(i + 2, end));
+                    result.append(inner.text()).append("\u00A7r");
+                    for (LinkSpan s : inner.links()) spans.add(new LinkSpan(innerBase + s.start(), innerBase + s.end(), s.url()));
                     i = end + 2;
                     continue;
                 }
@@ -2416,7 +2559,11 @@ public class ZulipBridgeScreen extends Screen {
                 int end = i + 1;
                 while (end < text.length() && text.charAt(end) != '*') end++;
                 if (end < text.length() && end > i + 1) {
-                    result.append("\u00A7o").append(applyInlineFormattingCodes(text.substring(i + 1, end))).append("\u00A7r");
+                    result.append("\u00A7o");
+                    int innerBase = result.length();
+                    FormattedContent inner = applyInlineFormattingCodesWithLinks(text.substring(i + 1, end));
+                    result.append(inner.text()).append("\u00A7r");
+                    for (LinkSpan s : inner.links()) spans.add(new LinkSpan(innerBase + s.start(), innerBase + s.end(), s.url()));
                     i = end + 1;
                     continue;
                 }
@@ -2435,7 +2582,7 @@ public class ZulipBridgeScreen extends Screen {
             result.append(c);
             i++;
         }
-        return result.toString();
+        return new FormattedContent(result.toString(), spans);
     }
 
     private List<String> wrapText(String text, int maxWidth) {
@@ -2475,6 +2622,130 @@ public class ZulipBridgeScreen extends Screen {
         }
 
         return lines;
+    }
+
+    /**
+     * Wraps {@code text} at {@code maxWidth} pixels while tracking the starting character offset
+     * of each wrapped line in {@code text}.  Link spans (positions in {@code text}) are filtered
+     * and rebased so they are relative to each wrapped line's start.
+     */
+    private List<WrappedSegment> wrapTextTracked(String text, int maxWidth, List<LinkSpan> allSpans) {
+        List<WrappedSegment> result = new ArrayList<>();
+        if (text == null) {
+            result.add(new WrappedSegment("", List.of()));
+            return result;
+        }
+
+        String normalized = text.replace('\t', ' ');
+        int pos = 0;
+
+        while (pos <= normalized.length()) {
+            // Find next paragraph boundary (\n, \r\n, or end of string)
+            int lineEnd = normalized.length();
+            int afterBreak = normalized.length() + 1; // sentinel: "we're done"
+            for (int j = pos; j < normalized.length(); j++) {
+                char ch = normalized.charAt(j);
+                if (ch == '\n') { lineEnd = j; afterBreak = j + 1; break; }
+                if (ch == '\r') {
+                    lineEnd = j;
+                    afterBreak = (j + 1 < normalized.length() && normalized.charAt(j + 1) == '\n') ? j + 2 : j + 1;
+                    break;
+                }
+            }
+
+            String paragraph = normalized.substring(pos, lineEnd);
+
+            if (paragraph.isBlank()) {
+                result.add(new WrappedSegment("", List.of()));
+                if (afterBreak > normalized.length()) break;
+                pos = afterBreak;
+                continue;
+            }
+
+            // Trim leading/trailing spaces, tracking offsets
+            int trimLeft = 0;
+            while (trimLeft < paragraph.length() && paragraph.charAt(trimLeft) == ' ') trimLeft++;
+            int trimRight = paragraph.length();
+            while (trimRight > trimLeft && paragraph.charAt(trimRight - 1) == ' ') trimRight--;
+
+            String remaining = paragraph.substring(trimLeft, trimRight);
+            int lineOffset = pos + trimLeft;
+
+            while (!remaining.isEmpty()) {
+                String line = this.textRenderer.trimToWidth(remaining, maxWidth);
+                if (line.isEmpty()) {
+                    line = remaining.substring(0, 1);
+                } else if (line.length() < remaining.length() && remaining.charAt(line.length()) != ' ') {
+                    int lastSpace = line.lastIndexOf(' ');
+                    if (lastSpace > 0) line = line.substring(0, lastSpace);
+                }
+
+                int segEnd = lineOffset + line.length();
+                List<LinkSpan> segSpans = new ArrayList<>();
+                for (LinkSpan span : allSpans) {
+                    if (span.start() < segEnd && span.end() > lineOffset) {
+                        segSpans.add(new LinkSpan(
+                            Math.max(0, span.start() - lineOffset),
+                            Math.min(line.length(), span.end() - lineOffset),
+                            span.url()
+                        ));
+                    }
+                }
+                result.add(new WrappedSegment(line, segSpans));
+
+                lineOffset += line.length();
+                String remainder = remaining.substring(line.length());
+                int spaces = 0;
+                while (spaces < remainder.length() && remainder.charAt(spaces) == ' ') spaces++;
+                remaining = remainder.substring(spaces);
+                lineOffset += spaces;
+            }
+
+            if (afterBreak > normalized.length()) break;
+            pos = afterBreak;
+        }
+
+        return result;
+    }
+
+    /**
+     * Adjusts link span character positions to account for emoji shortcode replacements.
+     * Each replaced `:shortcode:` shrinks the string by {@code shortcode.length() + 2 - 1} chars.
+     */
+    private List<LinkSpan> adjustSpansForEmojiReplacements(String originalText, List<LinkSpan> spans) {
+        if (spans.isEmpty()) return spans;
+
+        // Collect (start, originalLen, replacementLen) for each emoji match
+        List<int[]> reps = new ArrayList<>();
+        Matcher m = SHORTCODE_PATTERN.matcher(originalText);
+        while (m.find()) {
+            if (CustomEmojiRegistry.get(m.group(1)) != null) {
+                reps.add(new int[]{m.start(), m.end() - m.start(), InlineEmoji.PLACEHOLDER_TEXT.length()});
+            }
+        }
+        if (reps.isEmpty()) return spans;
+
+        List<LinkSpan> adjusted = new ArrayList<>(spans.size());
+        for (LinkSpan span : spans) {
+            int newStart = shiftPosition(span.start(), reps);
+            int newEnd = shiftPosition(span.end(), reps);
+            if (newStart < newEnd) adjusted.add(new LinkSpan(newStart, newEnd, span.url()));
+        }
+        return adjusted;
+    }
+
+    private static int shiftPosition(int pos, List<int[]> replacements) {
+        int shift = 0;
+        for (int[] rep : replacements) {
+            int repOrigEnd = rep[0] + rep[1];
+            if (rep[0] >= pos) break; // replacement is at or after pos, no effect
+            if (pos < repOrigEnd) {
+                // pos is inside the replaced region — snap to after replacement
+                return rep[0] + rep[2] + shift;
+            }
+            shift += rep[2] - rep[1];
+        }
+        return pos + shift;
     }
 
     private InlineEmojiContent replaceCustomEmojiWithPlaceholders(String content) {
@@ -2914,36 +3185,46 @@ public class ZulipBridgeScreen extends Screen {
     private record ZulipMessage(long id, String sender, String topic, String content, List<String> imageHashes, Map<String, Integer> reactions) {
     }
 
-    private record DisplayLine(String text, int color, String imageHash, boolean imageSpacer, List<String> inlineEmojiHashes, long messageId, boolean isHeader) {
+    private record DisplayLine(String text, int color, String imageHash, boolean imageSpacer, List<String> inlineEmojiHashes, long messageId, boolean isHeader, List<LinkSpan> links) {
         /** Non-message line (placeholder, separator, etc.). */
         DisplayLine(String text, int color) {
-            this(text, color, null, false, List.of(), 0, false);
+            this(text, color, null, false, List.of(), 0, false, List.of());
         }
 
         static DisplayLine header(String text, int color, long messageId) {
-            return new DisplayLine(text, color, null, false, List.of(), messageId, true);
+            return new DisplayLine(text, color, null, false, List.of(), messageId, true, List.of());
         }
 
         static DisplayLine content(String text, int color, List<String> inlineEmojiHashes, long messageId) {
-            return new DisplayLine(text, color, null, false, inlineEmojiHashes, messageId, false);
+            return new DisplayLine(text, color, null, false, inlineEmojiHashes, messageId, false, List.of());
+        }
+
+        static DisplayLine content(String text, int color, List<String> inlineEmojiHashes, long messageId, List<LinkSpan> links) {
+            return new DisplayLine(text, color, null, false, inlineEmojiHashes, messageId, false, links);
         }
 
         static DisplayLine image(String imageHash) {
-            return new DisplayLine("", 0xFFFFFFFF, imageHash, false, List.of(), 0, false);
+            return new DisplayLine("", 0xFFFFFFFF, imageHash, false, List.of(), 0, false, List.of());
         }
 
         static DisplayLine image(String imageHash, long messageId) {
-            return new DisplayLine("", 0xFFFFFFFF, imageHash, false, List.of(), messageId, false);
+            return new DisplayLine("", 0xFFFFFFFF, imageHash, false, List.of(), messageId, false, List.of());
         }
 
         static DisplayLine imageSpacer(String imageHash) {
-            return new DisplayLine("", 0xFFFFFFFF, imageHash, true, List.of(), 0, false);
+            return new DisplayLine("", 0xFFFFFFFF, imageHash, true, List.of(), 0, false, List.of());
         }
 
         static DisplayLine imageSpacer(String imageHash, long messageId) {
-            return new DisplayLine("", 0xFFFFFFFF, imageHash, true, List.of(), messageId, false);
+            return new DisplayLine("", 0xFFFFFFFF, imageHash, true, List.of(), messageId, false, List.of());
         }
     }
+
+    private record LinkSpan(int start, int end, String url) {}
+
+    private record FormattedContent(String text, List<LinkSpan> links) {}
+
+    private record WrappedSegment(String text, List<LinkSpan> links) {}
 
     /** Bounds of the [+] reaction button currently visible on screen, null if none. */
     private record ReactionButton(long messageId, int x, int y, int w, int h) {
