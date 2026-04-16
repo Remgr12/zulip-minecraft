@@ -15,7 +15,7 @@ It provides:
 
 ## Requirements
 
-- Minecraft `1.21.11
+- Minecraft `1.21.11`
 - Fabric Loader `0.19.1` or newer
 - Fabric API
 - owo-lib
